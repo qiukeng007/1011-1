@@ -877,120 +877,124 @@ class _QueryPageState extends State<QueryPage> with AutomaticKeepAliveClientMixi
       ),
       child: Padding(
         padding: const EdgeInsets.all(10),
-        child: Row(
+        child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            Expanded(
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
+            Row(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      // 商品名称
+                      _buildProductName(
+                          _productNameOverrides[_productKey(data)] ?? data.name,
+                          data),
+                      const SizedBox(height: 6),
+                      // 信息行
+                      _buildInfoRow(
+                        Icons.view_week,
+                        '条码',
+                        data.barcode.isNotEmpty ? data.barcode : barcode,
+                        onTap: () => _copyText(
+                            data.barcode.isNotEmpty ? data.barcode : barcode),
+                      ),
+                      // 一维码（对应商品条码，便于电脑扫码枪直接扫描）
+                      if (barcodePng != null)
+                        Padding(
+                          padding: const EdgeInsets.only(top: 6),
+                          child: FittedBox(
+                            fit: BoxFit.scaleDown,
+                            alignment: Alignment.centerLeft,
+                            child: Image.memory(
+                              barcodePng,
+                              gaplessPlayback: true,
+                            ),
+                          ),
+                        ),
+                      if (data.supplier.isNotEmpty)
+                        InkWell(
+                          onTap: () => _showSupplierPicker(data, _supplierOverrides[barcode] ?? data.supplier),
+                          borderRadius: BorderRadius.circular(4),
+                          child: Padding(
+                            padding: const EdgeInsets.only(top: 4),
+                            child: Row(
+                              children: [
+                                const Icon(Icons.business, size: 14, color: Color(0xFF28a745)),
+                                const SizedBox(width: 6),
+                                const Text('供货商：', style: TextStyle(fontSize: 13, color: AppConstants.textSecondary)),
+                                Expanded(
+                                  child: Text(
+                                    _supplierOverrides[barcode] ?? data.supplier,
+                                    style: const TextStyle(fontSize: 13, fontWeight: FontWeight.bold, color: Color(0xFF28a745)),
+                                    overflow: TextOverflow.ellipsis,
+                                  ),
+                                ),
+                                const Icon(Icons.edit, size: 13, color: Color(0xFF28a745)),
+                              ],
+                            ),
+                          ),
+                        ),
+                      // 进价 + 售价同行
+                      if (data.buyPrice != null || data.sellPrice != null)
+                        _buildPriceRow(data.buyPrice, data.sellPrice),
+                    ],
+                  ),
+                ),
+                const SizedBox(width: 10),
+                _buildProductImageBox(data, barcode),
+              ],
+            ),
+            // 单位行：单位信息 + 右侧变动明细按钮（右缘与图片框右缘对齐）
+            Padding(
+              padding: const EdgeInsets.only(top: 4),
+              child: Row(
                 children: [
-                  // 商品名称
-                  _buildProductName(
-                      _productNameOverrides[_productKey(data)] ?? data.name,
-                      data),
-                  const SizedBox(height: 6),
-                  // 信息行
-                  _buildInfoRow(
-                    Icons.view_week,
-                    '条码',
-                    data.barcode.isNotEmpty ? data.barcode : barcode,
-                    onTap: () => _copyText(
-                        data.barcode.isNotEmpty ? data.barcode : barcode),
-                  ),
-                  // 一维码（对应商品条码，便于电脑扫码枪直接扫描）
-                  if (barcodePng != null)
-                    Padding(
-                      padding: const EdgeInsets.only(top: 6),
-                      child: FittedBox(
-                        fit: BoxFit.scaleDown,
-                        alignment: Alignment.centerLeft,
-                        child: Image.memory(
-                          barcodePng,
-                          gaplessPlayback: true,
-                        ),
-                      ),
-                    ),
-                  if (data.supplier.isNotEmpty)
-                    InkWell(
-                      onTap: () => _showSupplierPicker(data, _supplierOverrides[barcode] ?? data.supplier),
-                      borderRadius: BorderRadius.circular(4),
-                      child: Padding(
-                        padding: const EdgeInsets.only(top: 4),
-                        child: Row(
-                          children: [
-                            const Icon(Icons.business, size: 14, color: Color(0xFF28a745)),
-                            const SizedBox(width: 6),
-                            const Text('供货商：', style: TextStyle(fontSize: 13, color: AppConstants.textSecondary)),
-                            Expanded(
-                              child: Text(
-                                _supplierOverrides[barcode] ?? data.supplier,
-                                style: const TextStyle(fontSize: 13, fontWeight: FontWeight.bold, color: Color(0xFF28a745)),
-                                overflow: TextOverflow.ellipsis,
-                              ),
-                            ),
-                            const Icon(Icons.edit, size: 13, color: Color(0xFF28a745)),
-                          ],
-                        ),
-                      ),
-                    ),
-                  // 单位行：单位信息 + 右侧变动明细按钮
-                  Padding(
-                    padding: const EdgeInsets.only(top: 4),
-                    child: Row(
-                      children: [
-                        const Icon(Icons.scale,
-                            size: 14, color: AppConstants.textSecondary),
-                        const SizedBox(width: 6),
-                        const Text('单位：',
-                            style: TextStyle(
-                                fontSize: 13,
-                                color: AppConstants.textSecondary)),
-                        Expanded(
-                          child: Text(
-                            data.unit,
-                            style: const TextStyle(fontSize: 13),
-                            overflow: TextOverflow.ellipsis,
-                          ),
-                        ),
-                        const SizedBox(width: 6),
-                        SizedBox(
-                          width: 70,
-                          child: OutlinedButton(
-                            onPressed: () => _openStockHistory(data, barcode),
-                            child: const Text('变动明细',
-                                style: TextStyle(fontSize: 10)),
-                            style: OutlinedButton.styleFrom(
-                              foregroundColor: AppConstants.primaryColor,
-                              padding: EdgeInsets.zero,
-                              minimumSize: const Size(0, 26),
-                              tapTargetSize: MaterialTapTargetSize.shrinkWrap,
-                              // 方角造型
-                              shape: RoundedRectangleBorder(
-                                borderRadius: BorderRadius.circular(2),
-                              ),
-                              side: BorderSide(
-                                  color: AppConstants.primaryColor
-                                      .withValues(alpha: 0.5)),
-                            ),
-                          ),
-                        ),
-                      ],
+                  const Icon(Icons.scale,
+                      size: 14, color: AppConstants.textSecondary),
+                  const SizedBox(width: 6),
+                  const Text('单位：',
+                      style: TextStyle(
+                          fontSize: 13,
+                          color: AppConstants.textSecondary)),
+                  Expanded(
+                    child: Text(
+                      data.unit,
+                      style: const TextStyle(fontSize: 13),
+                      overflow: TextOverflow.ellipsis,
                     ),
                   ),
-                  // 进价 + 售价同行
-                  if (data.buyPrice != null || data.sellPrice != null)
-                    _buildPriceRow(data.buyPrice, data.sellPrice),
+                  const SizedBox(width: 6),
+                  SizedBox(
+                    width: 70,
+                    child: OutlinedButton(
+                      onPressed: () => _openStockHistory(data, barcode),
+                      child: const Text('变动明细',
+                          style: TextStyle(fontSize: 10)),
+                      style: OutlinedButton.styleFrom(
+                        foregroundColor: AppConstants.primaryColor,
+                        padding: EdgeInsets.zero,
+                        minimumSize: const Size(0, 26),
+                        tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                        // 方角造型
+                        shape: RoundedRectangleBorder(
+                          borderRadius: BorderRadius.circular(2),
+                        ),
+                        side: BorderSide(
+                            color: AppConstants.primaryColor
+                                .withValues(alpha: 0.5)),
+                      ),
+                    ),
+                  ),
                 ],
               ),
             ),
-            const SizedBox(width: 10),
-            _buildProductImageBox(data, barcode),
           ],
         ),
       ),
     );
   }
-
   Widget _buildProductImageBox(ProductData data, String barcode) {
     final overrideUrl = _productImageOverrides[barcode];
     final imageUrl = overrideUrl ?? data.imageUrl;
@@ -1997,7 +2001,8 @@ class _QueryPageState extends State<QueryPage> with AutomaticKeepAliveClientMixi
           delta: _getDelta(key),
           btnType: _getBtnType(key),
           disabled: !entry.ok || entry.data == null,
-          onTap: () => _onTransferTap(key),
+          showButton: keys.length > 1,
+          onTap: keys.length > 1 ? () => _onTransferTap(key) : null,
           onDoubleTap: () => _startEditStock(key),
           isEditing: _editStockKey == key,
           stockController: _editStockKey == key ? _editStockController : null,
