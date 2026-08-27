@@ -12,6 +12,8 @@ class ConfigService {
   static const _passwordPrefix = 'pwd_';
   static const _baseUrlKey = 'base_url';
   static const _restockConfigKey = 'restock_config';
+  static const _cookiePrefix = 'cookie_';
+  static const _userIdPrefix = 'uid_';
 
   final FlutterSecureStorage _secureStorage;
 
@@ -55,7 +57,25 @@ class ConfigService {
         final password = await _secureStorage.read(
           key: '$_passwordPrefix${config.storeKey}',
         );
-        configs.add(config.copyWith(password: password ?? ''));
+        // 备份版本为逐店工号模式：清除总账号遗留的门店ID，所有门店参与搜索
+        final cleaned = config.copyWith(
+            password: password ?? '', storeId: '', enabled: true);
+        // 迁移旧标识（含门店ID）下保存的 Cookie/userId 到工号标识，避免重新登录
+        final oldStoreKey = config.storeKey;
+        final newStoreKey = cleaned.storeKey;
+        if (oldStoreKey != newStoreKey) {
+          final oldCookie = prefs.getString('$_cookiePrefix$oldStoreKey');
+          if (oldCookie != null && oldCookie.isNotEmpty) {
+            await prefs.setString('$_cookiePrefix$newStoreKey', oldCookie);
+          }
+          final oldUid = prefs.getString('$_userIdPrefix$oldStoreKey');
+          if (oldUid != null && oldUid.isNotEmpty) {
+            await prefs.setString('$_userIdPrefix$newStoreKey', oldUid);
+          }
+          await prefs.remove('$_cookiePrefix$oldStoreKey');
+          await prefs.remove('$_userIdPrefix$oldStoreKey');
+        }
+        configs.add(cleaned);
       }
       return configs;
     } catch (_) {

@@ -101,12 +101,20 @@ class StoreConfig {
   final String password;
   final String baseUrl;
 
+  /// 银豹门店ID（总账号登录后由「ID数据管理」同步，用于按门店查询）
+  final String storeId;
+
+  /// 是否参与首页搜索（勾选后才查询该门店库存）
+  final bool enabled;
+
   const StoreConfig({
     this.name = '',
     this.account = '',
     this.cashierJobNumber = '',
     this.password = '',
     this.baseUrl = 'https://beta28.pospal.cn',
+    this.storeId = '',
+    this.enabled = true,
   });
 
   StoreConfig copyWith({
@@ -115,6 +123,8 @@ class StoreConfig {
     String? cashierJobNumber,
     String? password,
     String? baseUrl,
+    String? storeId,
+    bool? enabled,
   }) {
     return StoreConfig(
       name: name ?? this.name,
@@ -122,6 +132,8 @@ class StoreConfig {
       cashierJobNumber: cashierJobNumber ?? this.cashierJobNumber,
       password: password ?? this.password,
       baseUrl: baseUrl ?? this.baseUrl,
+      storeId: storeId ?? this.storeId,
+      enabled: enabled ?? this.enabled,
     );
   }
 
@@ -130,6 +142,8 @@ class StoreConfig {
         'account': account,
         'cashierJobNumber': cashierJobNumber,
         'baseUrl': baseUrl,
+        'storeId': storeId,
+        'enabled': enabled,
       };
 
   /// 从 JSON 恢复（不含密码，密码单独加密存储）
@@ -138,11 +152,14 @@ class StoreConfig {
         account: json['account'] as String? ?? '',
         cashierJobNumber: json['cashierJobNumber'] as String? ?? '',
         baseUrl: json['baseUrl'] as String? ?? 'https://beta28.pospal.cn',
+        storeId: json['storeId'] as String? ?? '',
+        enabled: json['enabled'] as bool? ?? true,
       );
 
   /// 门店唯一标识（用于 Cookie 存储 key）
+  /// 备份版本为逐店工号登录模式，统一使用「后台|账号|工号」，
+  /// 不依赖总账号门店ID（兼容主版本遗留数据）。
   String get storeKey => '$baseUrl|$account|$cashierJobNumber';
-
   bool get isValid =>
       name.isNotEmpty &&
       account.isNotEmpty &&

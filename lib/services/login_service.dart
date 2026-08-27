@@ -47,7 +47,7 @@ class LoginService {
 
       final client = HttpClient();
       client.autoUncompress = true;
-      client.connectionTimeout = const Duration(seconds: 10);
+      client.connectionTimeout = const Duration(seconds: 15);
       try {
         // ---- 1. 抓取 Supplier/Manage 原始 HTML（提取门店 ID 与诊断）----
         String pageBody = '';
@@ -318,7 +318,7 @@ class LoginService {
       signinRequest.headers.set('Accept-Language', 'zh-CN,zh;q=0.9');
       signinRequest.followRedirects = false;
 
-      final signinResponse = await signinRequest.close().timeout(const Duration(seconds: 15));
+      final signinResponse = await signinRequest.close().timeout(const Duration(seconds: 20));
       await _readBody(signinResponse);
 
       if (signinResponse.statusCode >= 400) {
@@ -376,7 +376,7 @@ class LoginService {
       // 写入 form-encoded body
       loginRequest.write(_encodeForm(loginData));
 
-      final loginResponse = await loginRequest.close().timeout(const Duration(seconds: 15));
+      final loginResponse = await loginRequest.close().timeout(const Duration(seconds: 20));
       final loginBody = await _readBody(loginResponse);
 
       // 合并 Cookie
@@ -425,7 +425,7 @@ class LoginService {
       followRequest.headers.set('Referer', signinUrl.toString());
       followRequest.followRedirects = false;
 
-      final followResponse = await followRequest.close().timeout(const Duration(seconds: 10));
+      final followResponse = await followRequest.close().timeout(const Duration(seconds: 25));
       await _readBody(followResponse);
       cookie = _mergeSetCookie(cookie, followResponse.headers);
 
@@ -470,7 +470,7 @@ class LoginService {
       request.headers.set('Cookie', cookie);
       request.followRedirects = false;
 
-      final response = await request.close().timeout(const Duration(seconds: 10));
+      final response = await request.close().timeout(const Duration(seconds: 25));
       final body = await _readBody(response);
 
       if (response.statusCode != 200) return null;
