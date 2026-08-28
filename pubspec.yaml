@@ -27,6 +27,8 @@ dependencies:
   barcode: ^2.2.0
   # 打开 URL（浏览器下载）
   url_launcher: ^6.2.0
+  # WebView 内打开详情（注入店 Cookie 保持登录）
+  flutter_inappwebview: ^6.0.0
   # 获取 APP 版本号
   package_info_plus: ^8.0.0
   # 文件路径
