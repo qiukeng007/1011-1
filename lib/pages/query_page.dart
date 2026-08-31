@@ -901,45 +901,6 @@ class _QueryPageState extends State<QueryPage> with AutomaticKeepAliveClientMixi
                         onTap: () => _copyText(
                             data.barcode.isNotEmpty ? data.barcode : barcode),
                       ),
-                      // 一维码（对应商品条码，便于电脑扫码枪直接扫描）
-                      if (barcodePng != null)
-                        Padding(
-                          padding: const EdgeInsets.only(top: 6),
-                          child: FittedBox(
-                            fit: BoxFit.scaleDown,
-                            alignment: Alignment.centerLeft,
-                            child: Image.memory(
-                              barcodePng,
-                              gaplessPlayback: true,
-                            ),
-                          ),
-                        ),
-                      if (data.supplier.isNotEmpty)
-                        InkWell(
-                          onTap: () => _showSupplierPicker(data, _supplierOverrides[barcode] ?? data.supplier),
-                          borderRadius: BorderRadius.circular(4),
-                          child: Padding(
-                            padding: const EdgeInsets.only(top: 4),
-                            child: Row(
-                              children: [
-                                const Icon(Icons.business, size: 14, color: Color(0xFF28a745)),
-                                const SizedBox(width: 6),
-                                const Text('供货商：', style: TextStyle(fontSize: 13, color: AppConstants.textSecondary)),
-                                Expanded(
-                                  child: Text(
-                                    _supplierOverrides[barcode] ?? data.supplier,
-                                    style: const TextStyle(fontSize: 13, fontWeight: FontWeight.bold, color: Color(0xFF28a745)),
-                                    overflow: TextOverflow.ellipsis,
-                                  ),
-                                ),
-                                const Icon(Icons.edit, size: 13, color: Color(0xFF28a745)),
-                              ],
-                            ),
-                          ),
-                        ),
-                      // 进价 + 售价同行
-                      if (data.buyPrice != null || data.sellPrice != null)
-                        _buildPriceRow(data.buyPrice, data.sellPrice),
                     ],
                   ),
                 ),
@@ -947,6 +908,45 @@ class _QueryPageState extends State<QueryPage> with AutomaticKeepAliveClientMixi
                 _buildProductImageBox(data, barcode),
               ],
             ),
+            // 一维码（对应商品条码，便于电脑扫码枪直接扫描）
+            if (barcodePng != null)
+              Padding(
+                padding: const EdgeInsets.only(top: 6),
+                child: Align(
+                  alignment: Alignment.centerLeft,
+                  child: FittedBox(
+                    fit: BoxFit.scaleDown,
+                    alignment: Alignment.centerLeft,
+                    child: Image.memory(
+                      barcodePng,
+                      gaplessPlayback: true,
+                    ),
+                  ),
+                ),
+              ),
+            if (data.supplier.isNotEmpty)
+              InkWell(
+                onTap: () => _showSupplierPicker(data, _supplierOverrides[barcode] ?? data.supplier),
+                borderRadius: BorderRadius.circular(4),
+                child: Padding(
+                  padding: const EdgeInsets.only(top: 4),
+                  child: Row(
+                    children: [
+                      const Icon(Icons.business, size: 14, color: Color(0xFF28a745)),
+                      const SizedBox(width: 6),
+                      const Text('供货商：', style: TextStyle(fontSize: 13, color: AppConstants.textSecondary)),
+                      Expanded(
+                        child: Text(
+                          _supplierOverrides[barcode] ?? data.supplier,
+                          style: const TextStyle(fontSize: 13, fontWeight: FontWeight.bold, color: Color(0xFF28a745)),
+                          overflow: TextOverflow.ellipsis,
+                        ),
+                      ),
+                      const Icon(Icons.edit, size: 13, color: Color(0xFF28a745)),
+                    ],
+                  ),
+                ),
+              ),
             // 单位行：单位信息 + 右侧变动明细按钮（右缘与图片框右缘对齐）
             Padding(
               padding: const EdgeInsets.only(top: 4),
@@ -991,6 +991,9 @@ class _QueryPageState extends State<QueryPage> with AutomaticKeepAliveClientMixi
                 ],
               ),
             ),
+            // 进价 + 售价同行
+            if (data.buyPrice != null || data.sellPrice != null)
+              _buildPriceRow(data.buyPrice, data.sellPrice),
           ],
         ),
       ),
