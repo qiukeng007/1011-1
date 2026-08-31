@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:typed_data';
 import 'dart:io';
 import 'dart:math' as math;
@@ -15,6 +16,7 @@ import '../services/restock_service.dart';
 import '../services/query_service.dart';
 import '../services/session_manager.dart';
 import '../services/operation_log_service.dart';
+import '../services/offline_queue_service.dart';
 import '../models/product_result.dart';
 import '../utils/constants.dart';
 import '../widgets/barcode_icon.dart';
@@ -432,39 +434,38 @@ class _ReplenishFormState extends State<_ReplenishForm> {
       );
 
       if (mounted) {
+        // 银豹同步（不阻断补货流程）：供货商变更 / 用户手动上传的新图片
+        // 补货服务器断线不影响银豹，无论提交成败都执行
+        final syncMsgs = <String>[];
+        final originalSupplier = _originalSupplier?.trim() ?? '';
+        final currentSupplier = _selectedShop?.trim() ?? '';
+        final supplierChanged = originalSupplier.isNotEmpty &&
+            currentSupplier.isNotEmpty &&
+            currentSupplier != originalSupplier;
+        final imageChanged = _imageFromUser && _imageFile != null;
+        // 供货商同步与图片同步并行执行，缩短等待时间
+        var supplierSync = Future<String?>.value(null);
+        var imageSync = Future<String?>.value(null);
+        if (supplierChanged) {
+          supplierSync = _syncSupplierToPospal(currentSupplier);
+        }
+        if (imageChanged) {
+          imageSync = _syncImageToPospal();
+        }
+        final syncResults = await Future.wait([supplierSync, imageSync]);
+        if (supplierChanged) {
+          final syncErr = syncResults[0];
+          syncMsgs.add((syncErr == null || syncErr.isEmpty)
+              ? '供货商已同步到银豹'
+              : '供货商同步失败：$syncErr');
+        }
+        if (imageChanged) {
+          final imgSyncErr = syncResults[1];
+          syncMsgs.add((imgSyncErr == null || imgSyncErr.isEmpty)
+              ? '图片已同步到银豹'
+              : '图片同步失败：$imgSyncErr');
+        }
         if (ok) {
-          // 提交后的银豹同步（不阻断补货）：
-          // 1. 若补货界面修改了供货商，同步变更到银豹（所有已登录门店）
-          // 2. 若用户在补货界面手动上传了新图片，同步图片到银豹（所有已登录门店，覆盖旧图）
-          final syncMsgs = <String>[];
-          final originalSupplier = _originalSupplier?.trim() ?? '';
-          final currentSupplier = _selectedShop?.trim() ?? '';
-          final supplierChanged = originalSupplier.isNotEmpty &&
-              currentSupplier.isNotEmpty &&
-              currentSupplier != originalSupplier;
-          final imageChanged = _imageFromUser && _imageFile != null;
-          // 供货商同步与图片同步并行执行，缩短提交等待时间
-          var supplierSync = Future<String?>.value(null);
-          var imageSync = Future<String?>.value(null);
-          if (supplierChanged) {
-            supplierSync = _syncSupplierToPospal(currentSupplier);
-          }
-          if (imageChanged) {
-            imageSync = _syncImageToPospal();
-          }
-          final syncResults = await Future.wait([supplierSync, imageSync]);
-          if (supplierChanged) {
-            final syncErr = syncResults[0];
-            syncMsgs.add((syncErr == null || syncErr.isEmpty)
-                ? '供货商已同步到银豹'
-                : '供货商同步失败：$syncErr');
-          }
-          if (imageChanged) {
-            final imgSyncErr = syncResults[1];
-            syncMsgs.add((imgSyncErr == null || imgSyncErr.isEmpty)
-                ? '图片已同步到银豹'
-                : '图片同步失败：$imgSyncErr');
-          }
           final resultMsg = syncMsgs.isEmpty
               ? '提交成功！'
               : '提交成功，${syncMsgs.join('，')}';
@@ -516,13 +517,72 @@ class _ReplenishFormState extends State<_ReplenishForm> {
             }
           }
         } else {
-          _showMsg('提交失败，请检查网络和服务器地址');
+          final saved = await _saveReplenishOffline(imageBytes);
+          final baseMsg = saved
+              ? '服务器无法连接，已保存到本地，服务器恢复后自动提交'
+              : '提交失败，请检查网络和服务器地址';
+          if (syncMsgs.isNotEmpty) {
+            _showMsg('$baseMsg，${syncMsgs.join('，')}');
+          } else {
+            _showMsg(baseMsg);
+          }
+          if (saved) {
+            // 数据已保存到本地，等同提交成功处理：清空表单、返回首页、刷新结果与图片
+            final submittedBarcode = _barcodeCtrl.text;
+            final uploadedImageUrl = _syncedImageUrl;
+            _resetForm();
+            widget.onSubmitted?.call();
+            if (imageChanged &&
+                uploadedImageUrl != null &&
+                uploadedImageUrl.isNotEmpty &&
+                submittedBarcode.isNotEmpty) {
+              widget.onImageUploaded?.call(submittedBarcode, uploadedImageUrl);
+            }
+            if (supplierChanged &&
+                (syncResults[0] == null || syncResults[0]!.isEmpty)) {
+              widget.onSupplierSynced?.call(submittedBarcode, currentSupplier);
+            }
+          }
         }
       }
     } catch (e) {
       if (mounted) _showMsg('提交出错：$e');
     } finally {
       if (mounted) setState(() => _submitting = false);
+    }
+  }
+
+  /// 补货提交失败时保存到离线队列（内容相同的不重复保存）
+  Future<bool> _saveReplenishOffline(List<int> imageBytes) async {
+    try {
+      final items = await OfflineQueueService.instance.getItems();
+      final barcode = _barcodeCtrl.text;
+      final quantity = int.tryParse(_qtyCtrl.text) ?? 1;
+      final desc = _descCtrl.text;
+      for (final item in items) {
+        if (item.type == 'replenish' &&
+            item.shopName == _selectedShop &&
+            item.barcode == barcode &&
+            item.quantity == quantity &&
+            item.desc == desc) {
+          return true; // 已有相同待提交记录，避免重复保存
+        }
+      }
+      return await OfflineQueueService.instance.addItem(
+        OfflineQueueItem(
+          id: 'q${DateTime.now().millisecondsSinceEpoch}',
+          type: 'replenish',
+          shopName: _selectedShop!,
+          barcode: barcode,
+          quantity: quantity,
+          desc: desc,
+          imageBase64: base64Encode(imageBytes),
+          imageName: 'IMG_${DateTime.now().millisecondsSinceEpoch}.jpg',
+          createdAt: DateTime.now().toIso8601String(),
+        ),
+      );
+    } catch (_) {
+      return false;
     }
   }
 
@@ -1130,7 +1190,21 @@ class _BookingFormState extends State<_BookingForm> {
           _resetForm();
           widget.onSubmitted?.call();
         } else {
-          _showMsg('提交失败，请检查网络和服务器地址');
+          final saved = await OfflineQueueService.instance.addItem(
+            OfflineQueueItem(
+              id: 'q${DateTime.now().millisecondsSinceEpoch}',
+              type: 'booking',
+              shopName: _selectedShop ?? '',
+              barcode: _barcodeCtrl.text,
+              quantity: int.tryParse(_qtyCtrl.text) ?? 1,
+              desc: _descCtrl.text.trim(),
+              phone: _phoneCtrl.text.trim(),
+              imageBase64: base64Encode(imageBytes),
+              imageName: 'IMG_${DateTime.now().millisecondsSinceEpoch}.jpg',
+              createdAt: DateTime.now().toIso8601String(),
+            ),
+          );
+          _showMsg(saved ? '服务器无法连接，已保存到本地，连接服务器后自动提交' : '提交失败，请检查网络和服务器地址');
         }
       }
     } catch (e) {
