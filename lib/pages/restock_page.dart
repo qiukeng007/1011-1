@@ -427,7 +427,7 @@ class _ReplenishFormState extends State<_ReplenishForm> {
       final ok = await widget.service.submitReplenish(
         shopName: _selectedShop!,
         barcode: _barcodeCtrl.text,
-        quantity: int.tryParse(_qtyCtrl.text) ?? 1,
+        quantity: _qtyCtrl.text.trim(),
         desc: _descCtrl.text,
         imageBytes: imageBytes,
         imageName: 'IMG_${DateTime.now().millisecondsSinceEpoch}.jpg',
@@ -474,7 +474,7 @@ class _ReplenishFormState extends State<_ReplenishForm> {
             store: _selectedShop!,
             action: '补货',
             barcode: _barcodeCtrl.text,
-            detail: '数量: ${int.tryParse(_qtyCtrl.text) ?? 1}',
+            detail: '数量: ${_qtyCtrl.text.trim()}',
           );
           final submittedBarcode = _barcodeCtrl.text;
           final uploadedImageUrl = _syncedImageUrl;
@@ -557,7 +557,7 @@ class _ReplenishFormState extends State<_ReplenishForm> {
     try {
       final items = await OfflineQueueService.instance.getItems();
       final barcode = _barcodeCtrl.text;
-      final quantity = int.tryParse(_qtyCtrl.text) ?? 1;
+      final quantity = _qtyCtrl.text.trim();
       final desc = _descCtrl.text;
       for (final item in items) {
         if (item.type == 'replenish' &&
@@ -854,9 +854,9 @@ class _ReplenishFormState extends State<_ReplenishForm> {
                         controller: _qtyCtrl,
                         focusNode: _qtyFocus,
                         decoration: _inputDecoration(),
-                        keyboardType: TextInputType.number,
+                        keyboardType: TextInputType.text,
                         onTap: () {
-                          // 先收起当前键盘，再弹出数字键盘
+                          // 先收起当前键盘，再弹出输入键盘
                           FocusScope.of(context).unfocus();
                           Future.delayed(const Duration(milliseconds: 50), () {
                             if (mounted) _qtyFocus.requestFocus();
@@ -866,10 +866,7 @@ class _ReplenishFormState extends State<_ReplenishForm> {
                           );
                         },
                         validator: (v) {
-                          if (v == null || v.isEmpty) return '必填';
-                          if (int.tryParse(v) == null || int.parse(v) <= 0) {
-                            return '请输入有效数量';
-                          }
+                          if (v == null || v.trim().isEmpty) return '必填';
                           return null;
                         },
                       ),
@@ -1168,7 +1165,7 @@ class _BookingFormState extends State<_BookingForm> {
         shopName: _selectedShop,
         phone: _phoneCtrl.text.trim(),
         barcode: _barcodeCtrl.text,
-        quantity: int.tryParse(_qtyCtrl.text) ?? 1,
+        quantity: _qtyCtrl.text.trim(),
         desc: _descCtrl.text.trim(),
         imageBytes: imageBytes,
         imageName: 'IMG_${DateTime.now().millisecondsSinceEpoch}.jpg',
@@ -1182,7 +1179,7 @@ class _BookingFormState extends State<_BookingForm> {
               store: _selectedShop ?? '',
               action: '预定',
               barcode: _barcodeCtrl.text,
-              detail: '数量: ${int.tryParse(_qtyCtrl.text) ?? 1}',
+              detail: '数量: ${_qtyCtrl.text.trim()}',
             );
           } catch (_) {
             // 日志失败不影响提交结果
@@ -1196,7 +1193,7 @@ class _BookingFormState extends State<_BookingForm> {
               type: 'booking',
               shopName: _selectedShop ?? '',
               barcode: _barcodeCtrl.text,
-              quantity: int.tryParse(_qtyCtrl.text) ?? 1,
+              quantity: _qtyCtrl.text.trim(),
               desc: _descCtrl.text.trim(),
               phone: _phoneCtrl.text.trim(),
               imageBase64: base64Encode(imageBytes),
@@ -1341,12 +1338,9 @@ class _BookingFormState extends State<_BookingForm> {
                       TextFormField(
                         controller: _qtyCtrl,
                         decoration: _inputDecoration(),
-                        keyboardType: TextInputType.number,
+                        keyboardType: TextInputType.text,
                         validator: (v) {
-                          if (v == null || v.isEmpty) return '必填';
-                          if (int.tryParse(v) == null || int.parse(v) <= 0) {
-                            return '请输入有效数量';
-                          }
+                          if (v == null || v.trim().isEmpty) return '必填';
                           return null;
                         },
                       ),
