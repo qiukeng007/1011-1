@@ -107,6 +107,11 @@ class _QueryPageState extends State<QueryPage> with AutomaticKeepAliveClientMixi
   final Map<String, String> _productImageOverrides = {};
   bool _uploadingProductImage = false;
 
+  /// 供货商/商品名称等数据同步中：不遮全屏，仅禁用扫码/补货（打印不受影响）
+  bool _syncingProductData = false;
+
+  bool get _dataBusy => _uploadingProductImage || _syncingProductData;
+
   // 查询页手动更换的供货商（条码 -> 新供货商名，仅本次展示覆盖）
   final Map<String, String> _supplierOverrides = {};
   final Map<String, String> _productNameOverrides = {};
@@ -124,52 +129,13 @@ class _QueryPageState extends State<QueryPage> with AutomaticKeepAliveClientMixi
   bool _bannerError = false;
   Timer? _bannerTimer;
 
-  void _showBanner(String msg, {bool isError = false}) {
+  void _showBanner(String msg, {bool isError = false, bool sticky = false}) {
     _bannerTimer?.cancel();
     setState(() { _bannerMsg = msg; _bannerError = isError; });
+    if (sticky) return; // 长任务期间保持显示，任务结束时由最终提示替换
     _bannerTimer = Timer(const Duration(seconds: 2), () {
       if (mounted) setState(() => _bannerMsg = null);
     });
-  }
-
-  /// 全屏遮罩 + 转圈加载提示（修改商品名称等耗时操作期间告知用户）
-  VoidCallback _showBlockingLoading(String msg) {
-    final overlay = OverlayEntry(
-      builder: (ctx) => Positioned.fill(
-        child: Container(
-          color: Colors.black.withValues(alpha: 0.12),
-          alignment: const Alignment(0, 0.62),
-          child: Card(
-            elevation: 4,
-            shape: RoundedRectangleBorder(
-                borderRadius: BorderRadius.circular(12)),
-            child: Padding(
-              padding:
-                  const EdgeInsets.symmetric(horizontal: 24, vertical: 20),
-              child: Row(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  const SizedBox(
-                    width: 22,
-                    height: 22,
-                    child: CircularProgressIndicator(strokeWidth: 2.5),
-                  ),
-                  const SizedBox(width: 14),
-                  Flexible(
-                    child: Text(
-                      msg,
-                      style: const TextStyle(fontSize: 14),
-                    ),
-                  ),
-                ],
-              ),
-            ),
-          ),
-        ),
-      ),
-    );
-    Overlay.of(context, rootOverlay: true).insert(overlay);
-    return () => overlay.remove();
   }
 
   @override
@@ -576,35 +542,6 @@ class _QueryPageState extends State<QueryPage> with AutomaticKeepAliveClientMixi
       ),
     ),
       ),
-    // 图片上传/更新中：全屏遮罩，禁止任何操作
-    if (_uploadingProductImage)
-      Positioned.fill(
-        child: ColoredBox(
-          color: Colors.black.withValues(alpha: 0.12),
-          child: Align(
-            alignment: const Alignment(0, 0.62),
-            child: Container(
-              padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 14),
-              decoration: BoxDecoration(
-                color: Colors.white,
-                borderRadius: BorderRadius.circular(10),
-              ),
-              child: const Row(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  SizedBox(
-                    width: 22,
-                    height: 22,
-                    child: CircularProgressIndicator(strokeWidth: 2.5),
-                  ),
-                  SizedBox(width: 12),
-                  Text('正在上传图片，请稍候…', style: TextStyle(fontSize: 14, fontWeight: FontWeight.w600)),
-                ],
-              ),
-            ),
-          ),
-        ),
-      ),
     // 顶部通知横幅
     if (_bannerMsg != null)
       Positioned(
@@ -796,7 +733,7 @@ class _QueryPageState extends State<QueryPage> with AutomaticKeepAliveClientMixi
 
         // 补货 + 打印按钮
         const SizedBox(height: 10),
-        SizedBox(width: double.infinity, child: _actionBtn('补货', Icons.add_shopping_cart, AppConstants.primaryColor, () => _handleRestock(r))),
+        SizedBox(width: double.infinity, child: _actionBtn('补货', Icons.add_shopping_cart, AppConstants.primaryColor, () => _handleRestock(r), enabled: !_dataBusy)),
         const SizedBox(height: 6),
         Row(children: [
           if (_hasIp('p1')) Expanded(child: _actionBtn('大价签80', Icons.print, const Color(0xFFFF9800), () => _handleDirectPrint(r, 'p1'))),
@@ -1050,8 +987,10 @@ class _QueryPageState extends State<QueryPage> with AutomaticKeepAliveClientMixi
 
 /// 无图时点击：拍照/导入图片 → CropPage 手动裁剪成正方形 → 逐个门店上传
   Future<void> _addProductImage(ProductData data, String barcode) async {
-    if (widget.configs.isEmpty) {
-      _showBanner('未配置门店', isError: true);
+    // 只把新图片写入勾选（enabled）门店
+    final targetStores = widget.configs.where((c) => c.enabled).toList();
+    if (targetStores.isEmpty) {
+      _showBanner('未勾选任何门店，无法上传图片', isError: true);
       return;
     }
 
@@ -1099,7 +1038,7 @@ class _QueryPageState extends State<QueryPage> with AutomaticKeepAliveClientMixi
           _compressImageForUpload(await File(croppedPath).readAsBytes());
       // 所有门店并行上传（银豹图片按门店隔离，不会自动同步），失败自动重试 1 次
       // 静默重试直到成功（最多 5 次，失败自动重试，不中断不打扰）
-      final results = await Future.wait(widget.configs.map((store) async {
+      final results = await Future.wait(targetStores.map((store) async {
         String? lastErr;
         for (var attempt = 0; attempt < 5; attempt++) {
           if (attempt > 0) {
@@ -1145,7 +1084,7 @@ class _QueryPageState extends State<QueryPage> with AutomaticKeepAliveClientMixi
       if (successCount > 0) {
         // 同步写入操作记录描述（失败不阻断，只提示）
         final descErrors = <String>[];
-        for (final store in widget.configs) {
+        for (final store in targetStores) {
           final err = await widget.queryService.updateProductOperationNote(
             store,
             barcode,
@@ -1159,9 +1098,9 @@ class _QueryPageState extends State<QueryPage> with AutomaticKeepAliveClientMixi
         }
         if (!mounted) return;
         setState(() {});
-        final baseMsg = successCount == widget.configs.length
-            ? '图片上传成功 ✓（$successCount 个门店）'
-            : '部分门店成功（$successCount/${widget.configs.length}）：${failedStores.join('；')}';
+        final baseMsg = successCount == targetStores.length
+            ? '图片上传成功 ✓（$successCount 个勾选门店）'
+            : '部分勾选门店成功（$successCount/${targetStores.length}）：${failedStores.join('；')}';
         _showBanner(descErrors.isEmpty
             ? baseMsg
             : '$baseMsg；描述未写入：${descErrors.join('；')}',
@@ -1656,11 +1595,12 @@ class _QueryPageState extends State<QueryPage> with AutomaticKeepAliveClientMixi
 
   // ==================== 补货对话框 ====================
 
-  Widget _actionBtn(String label, IconData icon, Color color, VoidCallback onTap) {
+  Widget _actionBtn(String label, IconData icon, Color color, VoidCallback onTap,
+      {bool enabled = true}) {
     return SizedBox(
       height: 36,
       child: ElevatedButton.icon(
-        onPressed: onTap,
+        onPressed: enabled ? onTap : null,
         icon: Icon(icon, size: 16),
         label: Text(label, style: const TextStyle(fontSize: 12)),
         style: ElevatedButton.styleFrom(backgroundColor: color, foregroundColor: Colors.white,
@@ -1808,7 +1748,7 @@ class _QueryPageState extends State<QueryPage> with AutomaticKeepAliveClientMixi
                     child: TextField(
                       controller: _barcodeController,
                       focusNode: _barcodeFocus,
-                      enabled: !_uploadingProductImage,
+                      enabled: !_dataBusy,
                       keyboardType: TextInputType.number,
                       decoration: InputDecoration(
                         hintText: '扫描或输入条码',
@@ -1822,7 +1762,7 @@ class _QueryPageState extends State<QueryPage> with AutomaticKeepAliveClientMixi
                         ),
                         suffixIcon: IconButton(
                           icon: const Icon(Icons.search, size: 22),
-                          onPressed: _uploadingProductImage
+                          onPressed: _dataBusy
                               ? null
                               : () => _query(_barcodeController.text),
                         ),
@@ -1830,7 +1770,7 @@ class _QueryPageState extends State<QueryPage> with AutomaticKeepAliveClientMixi
                       style: const TextStyle(fontSize: 16),
                       textInputAction: TextInputAction.search,
                       onSubmitted: (v) {
-                        if (_uploadingProductImage) return;
+                        if (_dataBusy) return;
                         _query(v);
                       },
                     ),
@@ -1841,7 +1781,7 @@ class _QueryPageState extends State<QueryPage> with AutomaticKeepAliveClientMixi
                 SizedBox(
                   height: 42,
                   child: ElevatedButton(
-                    onPressed: (_querying || widget.verifying || _uploadingProductImage)
+                    onPressed: (_querying || widget.verifying || _dataBusy)
                         ? null
                         : () async {
                             final result = await Navigator.of(context).push<String>(
@@ -1876,7 +1816,7 @@ class _QueryPageState extends State<QueryPage> with AutomaticKeepAliveClientMixi
               width: double.infinity,
               height: 42,
               child: ElevatedButton(
-                onPressed: (_querying || widget.verifying || _uploadingProductImage)
+                onPressed: (_querying || widget.verifying || _dataBusy)
                     ? null
                     : () => _query(_barcodeController.text),
                 style: ElevatedButton.styleFrom(
@@ -2285,7 +2225,7 @@ class _QueryPageState extends State<QueryPage> with AutomaticKeepAliveClientMixi
     );
   }
 
-  /// 把查询页手动更换的供货商同步到银豹（所有已登录门店），并更新本地显示
+  /// 把查询页手动更换的供货商同步到银豹（仅勾选门店），并更新本地显示
   Future<void> _syncSupplierChange(
       ProductData data, String current, String newSupplier) async {
     final barcode =
@@ -2299,57 +2239,73 @@ class _QueryPageState extends State<QueryPage> with AutomaticKeepAliveClientMixi
       _showBanner('请填写操作员姓名后再更新供货商', isError: true);
       return;
     }
-    final hideLoading = _showBlockingLoading('正在同步供货商…');
+    final targetStores = widget.configs.where((c) => c.enabled).toList();
+    if (targetStores.isEmpty) {
+      _showBanner('未勾选任何门店，无法同步供货商', isError: true);
+      return;
+    }
+    // 不遮全屏：仅禁用扫码与补货，打印标签等操作保持可用
+    if (!mounted) return;
+    setState(() => _syncingProductData = true);
+    _showBanner('正在同步供货商…', sticky: true);
     final errors = <String>[];
     var syncedCount = 0;
-    for (final store in widget.configs) {
-      try {
-        final err = await widget.queryService.updateProductSupplier(
-          store,
-          barcode,
-          newSupplier,
-          productUid: data.uid?.toString(),
-        );
-        if (err == null) {
-          syncedCount++;
-        } else if (err != '未登录') {
-          errors.add('${store.name}：$err');
-        }
-      } catch (e) {
-        errors.add('${store.name}：$e');
-      }
-    }
-    hideLoading();
-    if (!mounted) return;
-    setState(() => _supplierOverrides[barcode] = newSupplier);
-    if (errors.isEmpty) {
-      if (syncedCount == 0) {
-        _showBanner('没有已登录的门店，无法同步', isError: true);
-        return;
-      }
-      final descErrors = <String>[];
-      for (final store in widget.configs) {
-        final err = await widget.queryService.updateProductOperationNote(
-          store,
-          barcode,
-          opName,
-          '更新供货商',
-          productUid: data.uid?.toString(),
-        );
-        if (err != null && err != '未登录') {
-          descErrors.add('${store.name}：$err');
+    try {
+      for (final store in targetStores) {
+        try {
+          final err = await widget.queryService.updateProductSupplier(
+            store,
+            barcode,
+            newSupplier,
+            productUid: data.uid?.toString(),
+          );
+          if (err == null) {
+            syncedCount++;
+          } else if (err != '未登录') {
+            errors.add('${store.name}：$err');
+          }
+        } catch (e) {
+          errors.add('${store.name}：$e');
         }
       }
-      _showBanner(descErrors.isEmpty
-          ? '供货商已更新为「$newSupplier」✓'
-          : '供货商已更新为「$newSupplier」，描述未写入：${descErrors.join('；')}',
-          isError: descErrors.isNotEmpty);
-    } else {
-      _showBanner('部分同步失败：${errors.join('；')}', isError: true);
+      if (!mounted) return;
+      setState(() => _supplierOverrides[barcode] = newSupplier);
+      if (errors.isEmpty) {
+        if (syncedCount == 0) {
+          _showBanner('勾选的门店都没有登录，无法同步', isError: true);
+          return;
+        }
+        // 操作记录描述（失败不阻断，静默忽略）
+        final descErrors = <String>[];
+        for (final store in targetStores) {
+          try {
+            final err = await widget.queryService.updateProductOperationNote(
+              store,
+              barcode,
+              opName,
+              '更新供货商',
+              productUid: data.uid?.toString(),
+            );
+            if (err != null && err != '未登录') {
+              descErrors.add('${store.name}：$err');
+            }
+          } catch (e) {
+            descErrors.add('${store.name}：$e');
+          }
+        }
+        _showBanner(descErrors.isEmpty
+            ? '供货商已更新为「$newSupplier」✓'
+            : '供货商已更新为「$newSupplier」，描述未写入：${descErrors.join('；')}',
+            isError: descErrors.isNotEmpty);
+      } else {
+        _showBanner('部分同步失败：${errors.join('；')}', isError: true);
+      }
+    } finally {
+      if (mounted) setState(() => _syncingProductData = false);
     }
   }
 
-  /// 双击商品名称：弹出编辑框，确定后同步到所有门店
+  /// 双击商品名称：弹出编辑框，确定后同步到勾选门店
   void _showProductNameEditor(ProductData data) {
     final current =
         _productNameOverrides[_productKey(data)] ?? data.name;
@@ -2399,7 +2355,7 @@ class _QueryPageState extends State<QueryPage> with AutomaticKeepAliveClientMixi
     );
   }
 
-  /// 把新商品名称同步到银豹（所有已登录门店），并更新本地所有门店卡片显示
+  /// 把新商品名称同步到银豹（仅勾选门店），并更新本地所有门店卡片显示
   Future<void> _syncProductNameChange(
       ProductData data, String newName) async {
     final key = _productKey(data);
@@ -2413,82 +2369,99 @@ class _QueryPageState extends State<QueryPage> with AutomaticKeepAliveClientMixi
       _showBanner('请填写操作员姓名后再更新名称', isError: true);
       return;
     }
-    final hideLoading = _showBlockingLoading('正在同步商品名称…');
+    final targetStores = widget.configs.where((c) => c.enabled).toList();
+    if (targetStores.isEmpty) {
+      _showBanner('未勾选任何门店，无法同步名称', isError: true);
+      return;
+    }
     final barcode =
         data.barcode.isNotEmpty ? data.barcode : _lastResult?.barcode ?? '';
+    // 不遮全屏：仅禁用扫码与补货，打印标签等操作保持可用
+    if (!mounted) return;
+    setState(() => _syncingProductData = true);
+    _showBanner('正在同步商品名称…', sticky: true);
     final errors = <String>[];
     var syncedCount = 0;
-    for (final store in widget.configs) {
-      try {
-        final err = await widget.queryService.updateProductName(
-          store,
-          barcode,
-          newName,
-          productUid: data.uid?.toString(),
-        );
-        if (err == null) {
-          syncedCount++;
-        } else if (err != '未登录') {
-          errors.add('${store.name}：$err');
+    try {
+      for (final store in targetStores) {
+        try {
+          final err = await widget.queryService.updateProductName(
+            store,
+            barcode,
+            newName,
+            productUid: data.uid?.toString(),
+          );
+          if (err == null) {
+            syncedCount++;
+          } else if (err != '未登录') {
+            errors.add('${store.name}：$err');
+          }
+        } catch (e) {
+          errors.add('${store.name}：$e');
         }
-      } catch (e) {
-        errors.add('${store.name}：$e');
       }
-    }
-    hideLoading();
-    if (!mounted) return;
-    // 本地立即生效：覆盖表 + 所选商品 + 所有门店卡片统一显示新名称
-    setState(() {
-      _productNameOverrides[key] = newName;
-      if (_chosenProduct != null) {
-        _chosenProduct = _chosenProduct!.copyWith(name: newName);
-      }
-      if (_lastResult != null) {
-        final stores = Map<String, StoreStockResult>.from(_lastResult!.stores);
-        for (final entry in stores.entries) {
-          final old = entry.value;
-          if (old.data == null) continue;
-          stores[entry.key] = StoreStockResult(
-            storeName: old.storeName,
-            data: old.data!.copyWith(name: newName),
-            error: old.error,
-            ok: old.ok,
+      if (!mounted) return;
+      // 本地立即生效：覆盖表 + 所选商品 + 所有门店卡片统一显示新名称
+      setState(() {
+        _productNameOverrides[key] = newName;
+        if (_chosenProduct != null) {
+          _chosenProduct = _chosenProduct!.copyWith(name: newName);
+        }
+        if (_lastResult != null) {
+          final stores = Map<String, StoreStockResult>.from(_lastResult!.stores);
+          for (final entry in stores.entries) {
+            final old = entry.value;
+            if (old.data == null) continue;
+            stores[entry.key] = StoreStockResult(
+              storeName: old.storeName,
+              data: old.data!.copyWith(name: newName),
+              error: old.error,
+              ok: old.ok,
+            );
+          }
+          _lastResult = MultiStoreResult(
+            barcode: _lastResult!.barcode,
+            stores: stores,
+            elapsedSeconds: _lastResult!.elapsedSeconds,
+            diagnostics: _lastResult!.diagnostics,
           );
         }
-        _lastResult = MultiStoreResult(
-          barcode: _lastResult!.barcode,
-          stores: stores,
-          elapsedSeconds: _lastResult!.elapsedSeconds,
-          diagnostics: _lastResult!.diagnostics,
-        );
-      }
-    });
-    if (errors.isEmpty) {
-      if (syncedCount == 0) {
-        _showBanner('没有已登录的门店，无法同步', isError: true);
-        return;
-      }
-      final descErrors = <String>[];
-      for (final store in widget.configs) {
-        final err = await widget.queryService.updateProductOperationNote(
-          store,
-          barcode,
-          opName,
-          '更新商品名称',
-          productUid: data.uid?.toString(),
-        );
-        if (err != null && err != '未登录') {
-          descErrors.add('${store.name}：$err');
+      });
+      if (errors.isEmpty) {
+        if (syncedCount == 0) {
+          _showBanner('勾选的门店都没有登录，无法同步', isError: true);
+          return;
         }
+        // 操作记录描述（失败不阻断，静默忽略）
+        final descErrors = <String>[];
+        for (final store in targetStores) {
+          try {
+            final err = await widget.queryService.updateProductOperationNote(
+              store,
+              barcode,
+              opName,
+              '更新商品名称',
+              productUid: data.uid?.toString(),
+            );
+            if (err != null && err != '未登录') {
+              descErrors.add('${store.name}：$err');
+            }
+          } catch (e) {
+            descErrors.add('${store.name}：$e');
+          }
+        }
+        _showBanner(descErrors.isEmpty
+            ? '商品名称已更新为「$newName」✓'
+            : '商品名称已更新为「$newName」，描述未写入：${descErrors.join('；')}',
+            isError: descErrors.isNotEmpty);
+      } else {
+        _showBanner('部分同步失败：${errors.join('；')}', isError: true);
       }
-      _showBanner(descErrors.isEmpty
-          ? '商品名称已更新为「$newName」✓'
-          : '商品名称已更新为「$newName」，描述未写入：${descErrors.join('；')}',
-          isError: descErrors.isNotEmpty);
-    } else {
-      _showBanner('部分同步失败：${errors.join('；')}', isError: true);
+    } finally {
+      if (mounted) setState(() => _syncingProductData = false);
     }
   }
+
   void _showSourcePicker(String targetKey) {
     final keys = _getStoreKeys();
     final otherKeys = keys.where((k) => k != targetKey).toList();

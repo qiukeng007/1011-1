@@ -495,7 +495,8 @@ class _ReplenishFormState extends State<_ReplenishForm> {
           if (opName.isNotEmpty) {
             if (supplierChanged &&
                 (syncResults[0] == null || syncResults[0]!.isEmpty)) {
-              for (final store in widget.configs ?? []) {
+              for (final store in (widget.configs ?? [])
+                  .where((c) => c.enabled)) {
                 await widget.queryService?.updateProductOperationNote(
                   store,
                   submittedBarcode,
@@ -506,7 +507,8 @@ class _ReplenishFormState extends State<_ReplenishForm> {
             }
             if (imageChanged &&
                 (syncResults[1] == null || syncResults[1]!.isEmpty)) {
-              for (final store in widget.configs ?? []) {
+              for (final store in (widget.configs ?? [])
+                  .where((c) => c.enabled)) {
                 await widget.queryService?.updateProductOperationNote(
                   store,
                   submittedBarcode,
@@ -586,13 +588,13 @@ class _ReplenishFormState extends State<_ReplenishForm> {
     }
   }
 
-  /// 把补货界面修改后的供货商同步到银豹（所有已登录门店）
+  /// 把补货界面修改后的供货商同步到银豹（仅勾选门店）
   /// 返回 null 表示全部同步成功，否则返回错误信息（补货不受影响）
   Future<String?> _syncSupplierToPospal(String newSupplierName) async {
     final queryService = widget.queryService;
-    final configs = widget.configs;
+    final configs = widget.configs?.where((c) => c.enabled).toList();
     if (queryService == null || configs == null || configs.isEmpty) {
-      return '未配置门店，无法同步';
+      return '未勾选任何门店，无法同步';
     }
     final errors = <String>[];
     var syncedCount = 0;
@@ -619,13 +621,13 @@ class _ReplenishFormState extends State<_ReplenishForm> {
     return errors.join('；');
   }
 
-  /// 把补货界面手动上传的新图片同步到银豹（覆盖旧图）
-  /// 遍历所有已登录门店上传，返回 null 表示全部成功，否则返回错误信息（补货不受影响）
+  /// 把补货界面手动上传的新图片同步到银豹（覆盖旧图，仅勾选门店）
+  /// 遍历勾选门店上传，返回 null 表示全部成功，否则返回错误信息（补货不受影响）
   Future<String?> _syncImageToPospal() async {
     final queryService = widget.queryService;
-    final configs = widget.configs;
+    final configs = widget.configs?.where((c) => c.enabled).toList();
     if (queryService == null || configs == null || configs.isEmpty) {
-      return '未配置门店，无法同步';
+      return '未勾选任何门店，无法同步';
     }
     final file = _imageFile;
     if (file == null) return '缺少图片，无法同步';
