@@ -1,11 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
-import 'dart:typed_data';
 import 'dart:io';
-import 'dart:math' as math;
-import 'dart:ui' as ui;
 import 'package:flutter/material.dart';
-import 'package:flutter/rendering.dart';
 import 'package:image_picker/image_picker.dart';
 import 'package:image/image.dart' as img;
 import '../widgets/crop_page.dart';
@@ -14,10 +10,9 @@ import '../models/store_config.dart';
 import '../services/product_image_cache.dart';
 import '../services/restock_service.dart';
 import '../services/query_service.dart';
-import '../services/session_manager.dart';
 import '../services/operation_log_service.dart';
 import '../services/offline_queue_service.dart';
-import '../models/product_result.dart';
+import '../services/photo_queue_service.dart';
 import '../utils/constants.dart';
 import '../widgets/barcode_icon.dart';
 import '../widgets/scanner_view.dart';
@@ -245,8 +240,6 @@ class _ReplenishFormState extends State<_ReplenishForm> {
   final _descFocus = FocusNode();
   File? _imageFile;
   bool _submitting = false;
-  /// 本次提交上传到银豹成功后的新图片地址（用于回传查询页刷新显示）
-  String? _syncedImageUrl;
   /// 用户是否在补货界面手动上传/拍照了新图片（需要同步到银豹，覆盖旧图）
   bool _imageFromUser = false;
 
@@ -443,27 +436,33 @@ class _ReplenishFormState extends State<_ReplenishForm> {
             currentSupplier.isNotEmpty &&
             currentSupplier != originalSupplier;
         final imageChanged = _imageFromUser && _imageFile != null;
-        // 供货商同步与图片同步并行执行，缩短等待时间
-        var supplierSync = Future<String?>.value(null);
-        var imageSync = Future<String?>.value(null);
+        String? supplierErr;
         if (supplierChanged) {
-          supplierSync = _syncSupplierToPospal(currentSupplier);
-        }
-        if (imageChanged) {
-          imageSync = _syncImageToPospal();
-        }
-        final syncResults = await Future.wait([supplierSync, imageSync]);
-        if (supplierChanged) {
-          final syncErr = syncResults[0];
-          syncMsgs.add((syncErr == null || syncErr.isEmpty)
+          supplierErr = await _syncSupplierToPospal(currentSupplier);
+          syncMsgs.add((supplierErr == null || supplierErr.isEmpty)
               ? '供货商已同步到银豹'
-              : '供货商同步失败：$syncErr');
+              : '供货商同步失败：$supplierErr');
         }
         if (imageChanged) {
-          final imgSyncErr = syncResults[1];
-          syncMsgs.add((imgSyncErr == null || imgSyncErr.isEmpty)
-              ? '图片已同步到银豹'
-              : '图片同步失败：$imgSyncErr');
+          try {
+            final imgBytes = await _imageFile!.readAsBytes();
+            final stores = (widget.configs ?? [])
+                .where((c) =>
+                    c.enabled && (c.storeId.isNotEmpty || c.isValid))
+                .toList();
+            await PhotoQueueService.instance.enqueue(
+              type: PhotoJobType.restock,
+              barcode: _barcodeCtrl.text,
+              productName: _productName ?? '',
+              imageBytes: imgBytes,
+              opName: widget.service.operatorName.trim(),
+              writeDesc: true,
+              stores: stores,
+            );
+            syncMsgs.add('照片已入后台队列');
+          } catch (e) {
+            syncMsgs.add('照片入队失败：$e');
+          }
         }
         if (ok) {
           final resultMsg = syncMsgs.isEmpty
@@ -477,45 +476,26 @@ class _ReplenishFormState extends State<_ReplenishForm> {
             detail: '数量: ${_qtyCtrl.text.trim()}',
           );
           final submittedBarcode = _barcodeCtrl.text;
-          final uploadedImageUrl = _syncedImageUrl;
           _resetForm();
           widget.onSubmitted?.call();
-          if (imageChanged &&
-              uploadedImageUrl != null &&
-              uploadedImageUrl.isNotEmpty &&
-              submittedBarcode.isNotEmpty) {
-            widget.onImageUploaded?.call(submittedBarcode, uploadedImageUrl);
-          }
           if (supplierChanged &&
-              (syncResults[0] == null || syncResults[0]!.isEmpty)) {
+              (supplierErr == null || supplierErr.isEmpty)) {
             widget.onSupplierSynced?.call(submittedBarcode, currentSupplier);
           }
-          // 操作记录描述（失败不阻断，静默忽略）：供货商变更 / 图片更新
+          // 供货商操作记录描述（失败不阻断）；照片操作记录由后台队列写入
           final opName = widget.service.operatorName.trim();
-          if (opName.isNotEmpty) {
-            if (supplierChanged &&
-                (syncResults[0] == null || syncResults[0]!.isEmpty)) {
-              for (final store in (widget.configs ?? [])
-                  .where((c) => c.enabled)) {
-                await widget.queryService?.updateProductOperationNote(
-                  store,
-                  submittedBarcode,
-                  opName,
-                  '更新供货商',
-                );
-              }
-            }
-            if (imageChanged &&
-                (syncResults[1] == null || syncResults[1]!.isEmpty)) {
-              for (final store in (widget.configs ?? [])
-                  .where((c) => c.enabled)) {
-                await widget.queryService?.updateProductOperationNote(
-                  store,
-                  submittedBarcode,
-                  opName,
-                  '更新照片',
-                );
-              }
+          if (opName.isNotEmpty &&
+              supplierChanged &&
+              (supplierErr == null || supplierErr.isEmpty)) {
+            for (final store in (widget.configs ?? [])
+                .where((c) =>
+                    c.enabled && (c.storeId.isNotEmpty || c.isValid))) {
+              await widget.queryService?.updateProductOperationNote(
+                store,
+                submittedBarcode,
+                opName,
+                '更新供货商',
+              );
             }
           }
         } else {
@@ -529,19 +509,12 @@ class _ReplenishFormState extends State<_ReplenishForm> {
             _showMsg(baseMsg);
           }
           if (saved) {
-            // 数据已保存到本地，等同提交成功处理：清空表单、返回首页、刷新结果与图片
+            // 数据已保存到本地，等同提交成功处理：清空表单、返回首页（照片已入后台队列）
             final submittedBarcode = _barcodeCtrl.text;
-            final uploadedImageUrl = _syncedImageUrl;
             _resetForm();
             widget.onSubmitted?.call();
-            if (imageChanged &&
-                uploadedImageUrl != null &&
-                uploadedImageUrl.isNotEmpty &&
-                submittedBarcode.isNotEmpty) {
-              widget.onImageUploaded?.call(submittedBarcode, uploadedImageUrl);
-            }
             if (supplierChanged &&
-                (syncResults[0] == null || syncResults[0]!.isEmpty)) {
+                (supplierErr == null || supplierErr.isEmpty)) {
               widget.onSupplierSynced?.call(submittedBarcode, currentSupplier);
             }
           }
@@ -619,97 +592,6 @@ class _ReplenishFormState extends State<_ReplenishForm> {
       return null;
     }
     return errors.join('；');
-  }
-
-  /// 把补货界面手动上传的新图片同步到银豹（覆盖旧图，仅勾选门店）
-  /// 遍历勾选门店上传，返回 null 表示全部成功，否则返回错误信息（补货不受影响）
-  Future<String?> _syncImageToPospal() async {
-    final queryService = widget.queryService;
-    final configs = widget.configs?.where((c) => c.enabled).toList();
-    if (queryService == null || configs == null || configs.isEmpty) {
-      return '未勾选任何门店，无法同步';
-    }
-    final file = _imageFile;
-    if (file == null) return '缺少图片，无法同步';
-    try {
-      // 银豹限制单图不超过 3MB，上传前统一压缩到 500KB 以内，体积小更稳定
-      final bytes = _compressImageForUpload(await file.readAsBytes());
-      // 所有门店并行上传，失败自动重试 1 次，显著缩短总耗时并提高成功率
-      final futures = configs
-          .map((store) => _uploadImageWithRetry(queryService, store, bytes))
-          .toList();
-      final results = await Future.wait(futures);
-      final errors = <String>[];
-      String? newImageUrl;
-      var syncedCount = 0;
-      for (var i = 0; i < results.length; i++) {
-        final r = results[i];
-        if (r.error == null) {
-          syncedCount++;
-          if (r.imageUrl != null && r.imageUrl!.isNotEmpty) {
-            newImageUrl = r.imageUrl;
-          }
-        } else {
-          errors.add('${configs[i].name}：${r.error}');
-        }
-      }
-      _syncedImageUrl = newImageUrl;
-      if (errors.isEmpty) {
-        if (syncedCount == 0) return '没有已登录的门店，无法同步';
-        return null;
-      }
-      return errors.join('；');
-    } catch (e) {
-      return '图片读取或压缩失败：$e';
-    }
-  }
-
-  /// 单门店图片上传，失败自动重试 1 次；返回 (error, url)：error 为 null 表示成功（未登录视为跳过）
-  Future<({String? error, String? imageUrl})> _uploadImageWithRetry(
-      QueryService queryService, StoreConfig store, List<int> bytes) async {
-    String? lastErr;
-    for (var attempt = 0; attempt < 2; attempt++) {
-      try {
-        final (err, url) = await queryService.replaceProductImage(
-          store,
-          _barcodeCtrl.text,
-          bytes,
-          'IMG_${DateTime.now().millisecondsSinceEpoch}.jpg',
-        );
-        if (err == null && url != null) {
-          return (error: null, imageUrl: url);
-        }
-        if (err == '未登录') return (error: null, imageUrl: null); // 未登录跳过，不视为失败
-        lastErr = err;
-      } catch (e) {
-        lastErr = e.toString();
-      }
-    }
-    return (error: lastErr, imageUrl: null);
-  }
-
-  /// 上传图片统一压缩到 500KB 以内（与查询页无图上传同逻辑）
-  List<int> _compressImageForUpload(Uint8List bytes) {
-    if (bytes.length < 512 * 1024) return bytes; // 已 ≤500KB
-    try {
-      final decoded = img.decodeImage(bytes);
-      if (decoded == null) return bytes;
-      final img2 = decoded.width >= decoded.height
-          ? img.copyResize(decoded, width: 1200)
-          : img.copyResize(decoded, height: 1200);
-      // 逐级降质量直到 ≤500KB
-      for (final q in [85, 70, 50, 35]) {
-        final encoded = img.encodeJpg(img2, quality: q);
-        if (encoded.length < 512 * 1024) return encoded;
-      }
-      // 仍超限：缩小到 800 再压
-      final img3 = img2.width >= img2.height
-          ? img.copyResize(img2, width: 800)
-          : img.copyResize(img2, height: 800);
-      return img.encodeJpg(img3, quality: 60);
-    } catch (_) {
-      return bytes;
-    }
   }
 
   Future<void> _askOperatorName() async {

@@ -3,6 +3,8 @@ import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:package_info_plus/package_info_plus.dart';
+import 'package:path_provider/path_provider.dart';
+import 'package:share_plus/share_plus.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import '../services/auth_service.dart';
 import '../models/store_config.dart';
@@ -10,6 +12,7 @@ import '../models/login_session.dart';
 import '../models/query_log.dart';
 import '../services/config_service.dart';
 import '../services/login_service.dart';
+import '../services/photo_queue_service.dart';
 import '../services/session_manager.dart';
 import '../services/query_logger.dart';
 import '../services/keepalive_logger.dart';
@@ -60,11 +63,21 @@ class _SettingsPageState extends State<SettingsPage> {
   // 登录状态跟踪
   final Map<String, LoginStatus> _loginStatuses = {};
   final Map<String, LoginProgress> _loginProgresses = {};
+  // 照片后台队列记录（队列中 + 历史，时间倒序）
+  List<PhotoJob> _photoJobs = [];
 
   @override
   void initState() {
     super.initState();
+    PhotoQueueService.instance.addListener(_reloadPhotoJobs);
+    _reloadPhotoJobs();
     _loadConfigs();
+  }
+
+  /// 队列/日志变化后刷新显示
+  Future<void> _reloadPhotoJobs() async {
+    final jobs = await PhotoQueueService.instance.allJobs();
+    if (mounted) setState(() => _photoJobs = jobs);
   }
 
   @override
@@ -80,6 +93,7 @@ class _SettingsPageState extends State<SettingsPage> {
   void dispose() {
     _autoSaveTimer?.cancel();
     _serverCheckTimer?.cancel();
+    PhotoQueueService.instance.removeListener(_reloadPhotoJobs);
     _baseUrlCtrl.dispose();
     _serverCtrl.dispose();
     _suppliersCtrl.dispose();
@@ -439,6 +453,12 @@ class _SettingsPageState extends State<SettingsPage> {
           padding: const EdgeInsets.symmetric(horizontal: 16),
           child: _buildKeepAliveCard(),
         ),
+        // 5c. 照片队列日志
+        const SizedBox(height: 8),
+        Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 16),
+          child: _buildPhotoQueueCard(),
+        ),
                 // 6. 版本号
         Padding(
           padding: const EdgeInsets.only(bottom: 24),
@@ -446,6 +466,321 @@ class _SettingsPageState extends State<SettingsPage> {
         ),
       ],
     );
+  }
+
+  Widget _buildPhotoQueueCard() {
+    final n = PhotoQueueService.instance.pendingCount;
+    return Card(
+      margin: const EdgeInsets.only(bottom: 8),
+      elevation: 0,
+      color: AppConstants.bgColor,
+      shape: RoundedRectangleBorder(
+        borderRadius: BorderRadius.circular(AppConstants.radiusSm),
+      ),
+      child: Padding(
+        padding: const EdgeInsets.all(12),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                const Expanded(
+                  child: Text('照片队列日志',
+                      style: TextStyle(
+                          fontSize: 15, fontWeight: FontWeight.w600)),
+                ),
+                if (n > 0)
+                  Text('剩余 $n 条',
+                      style: const TextStyle(
+                          fontSize: 12,
+                          color: Color(0xFF2E7D32),
+                          fontWeight: FontWeight.w600)),
+                if (_photoJobs.isNotEmpty)
+                  Padding(
+                    padding: const EdgeInsets.only(right: 4),
+                    child: GestureDetector(
+                      onTap: _exportPhotoQueueLog,
+                      child: const Icon(Icons.share_outlined,
+                          size: 18, color: AppConstants.primaryColor),
+                    ),
+                  ),
+                if (_photoJobs.isNotEmpty)
+                  TextButton(
+                    onPressed: _confirmClearPhotoHistory,
+                    child: const Text('清空历史'),
+                  ),
+              ],
+            ),
+            const SizedBox(height: 4),
+            const Text(
+                '记录全门店结果与逐步耗时（用于分析上传慢）；失败/部分成功保留本地图片，可在此重新排队。',
+                style: TextStyle(fontSize: 12, color: AppConstants.textSecondary)),
+            const SizedBox(height: 8),
+            if (_photoJobs.isEmpty)
+              const Padding(
+                padding: EdgeInsets.symmetric(vertical: 8),
+                child: Text('暂无照片队列记录',
+                    style:
+                        TextStyle(fontSize: 12, color: AppConstants.textSecondary)),
+              )
+            else
+              for (final job in _photoJobs) _buildPhotoJobTile(job),
+          ],
+        ),
+      ),
+    );
+  }
+
+
+  /// 导出照片队列日志（队列中 + 历史）为文本并分享，供分析耗时原因
+  Future<void> _exportPhotoQueueLog() async {
+    try {
+      final jobs = await PhotoQueueService.instance.allJobs();
+      jobs.sort((a, b) => b.createdAt.compareTo(a.createdAt));
+      final buf = StringBuffer();
+      buf.writeln('银豹查询 - 照片队列日志');
+      buf.writeln('导出时间: ${DateTime.now().toIso8601String()}');
+      buf.writeln('记录数: ${jobs.length} 条（配置页保留最近 ${PhotoQueueService.historyCap} 条）');
+      buf.writeln('');
+      buf.writeln('说明（字段口径）:');
+      buf.writeln('  总耗时 = 点击提交入队 → 任务彻底结束（含排队等待、重试退避、App 中途退后台时间）');
+      buf.writeln('  排队等待 = 创建时间 → 首次开始处理；实际处理 = 首次开始 → 完成');
+      buf.writeln('  若连续提交多条照片，后一条需等前一条跑完才开始，排队时间会计入总耗时');
+      buf.writeln('  总耗时明显大于单个门店耗时，通常来自：排队等待、失败重试退避、App 切后台、写操作记录');
+      buf.writeln('');
+      buf.writeln('=== 记录（最新在前） ===');
+      for (var i = 0; i < jobs.length; i++) {
+        final job = jobs[i];
+        final now = DateTime.now();
+        final started = DateTime.tryParse(job.startedAt ?? '');
+        final finished = DateTime.tryParse(job.finishedAt ?? '');
+        final totalMs = job.totalMs ??
+            now.difference(job.createdAt).inMilliseconds;
+        final waitMs = started
+            ?.difference(job.createdAt).inMilliseconds;
+        final runMs = (started == null || finished == null)
+            ? null
+            : finished.difference(started).inMilliseconds;
+        buf.writeln('');
+        buf.writeln('[$i] ${job.type.label} · 条码 ${job.barcode}'
+            '${job.productName.isNotEmpty ? ' · ${job.productName}' : ''}');
+        buf.writeln('    状态: ${job.status.label} | 尝试 ${job.attempts}/${PhotoQueueService.maxAttempts}');
+        buf.writeln('    创建: ${_fmtTime(job.createdAt)}');
+        if (started != null) {
+          buf.writeln('    开始处理: ${_fmtTime(started)}');
+        }
+        if (finished != null) {
+          buf.writeln('    完成: ${_fmtTime(finished)}');
+        }
+        buf.writeln('    总耗时: ${_fmtDur(totalMs)}'
+            '${waitMs != null ? ' | 排队等待: ${_fmtDur(waitMs)}' : ' | 排队等待: 旧记录未记录'}'
+            '${runMs != null ? ' | 实际处理: ${_fmtDur(runMs)}' : ''}');
+        for (final store in job.stores) {
+          PhotoStoreResult? r;
+          for (final x in job.results) {
+            if (x.storeKey == store.storeKey) {
+              r = x;
+              break;
+            }
+          }
+          if (r == null) {
+            buf.writeln('    - ${store.name}: 未开始');
+            continue;
+          }
+          final stepText = r.steps.isEmpty
+              ? ''
+              : r.steps.map((s) => '${s.name} ${_fmtDur(s.ms)}').join(' → ');
+          buf.writeln('    - ${r.storeName}: ${r.statusText}'
+              '${r.wallMs > 0 ? ' | 整店耗时 ${_fmtDur(r.wallMs)}' : ''}'
+              '${r.error != null ? '（${r.error}）' : ''}');
+          if (stepText.isNotEmpty) {
+            buf.writeln('        分步: $stepText');
+          }
+        }
+      }
+      final dir = await getTemporaryDirectory();
+      final file = File(
+          '${dir.path}${Platform.pathSeparator}照片队列日志_${DateTime.now().millisecondsSinceEpoch}.txt');
+      await file.writeAsString(buf.toString());
+      await Share.shareXFiles([XFile(file.path)], subject: '银豹查询 照片队列日志');
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('导出失败: $e')));
+      }
+    }
+  }
+
+  String _fmtDur(int ms) {
+    if (ms < 1000) return '$ms 毫秒';
+    if (ms < 60000) return '${(ms / 1000).toStringAsFixed(1)} 秒';
+    return '${(ms / 60000).toStringAsFixed(1)} 分钟';
+  }
+
+  Color _photoStatusColor(PhotoJobStatus s) {
+    switch (s) {
+      case PhotoJobStatus.success:
+        return AppConstants.successColor;
+      case PhotoJobStatus.partial:
+        return const Color(0xFFF57C00);
+      case PhotoJobStatus.failed:
+        return AppConstants.errorColor;
+      case PhotoJobStatus.superseded:
+        return AppConstants.textSecondary;
+      case PhotoJobStatus.waitingLogin:
+        return const Color(0xFFFFB300);
+      case PhotoJobStatus.processing:
+        return const Color(0xFF1976D2);
+      case PhotoJobStatus.pending:
+        return AppConstants.textSecondary;
+    }
+  }
+
+  Widget _buildPhotoJobTile(PhotoJob job) {
+    final color = _photoStatusColor(job.status);
+    final storeRows = <Widget>[];
+    for (final store in job.stores) {
+      PhotoStoreResult? r;
+      for (final x in job.results) {
+        if (x.storeKey == store.storeKey) {
+          r = x;
+          break;
+        }
+      }
+      if (r == null) {
+        storeRows.add(Padding(
+          padding: const EdgeInsets.only(top: 2),
+          child: Text('${store.name}：未开始',
+              style: const TextStyle(fontSize: 12, color: AppConstants.textSecondary)),
+        ));
+        continue;
+      }
+      final stepText = r.steps.isEmpty
+          ? ''
+          : r.steps.map((s) => '${s.name}${s.ms} 毫秒').join(' → ');
+      storeRows.add(Padding(
+        padding: const EdgeInsets.only(top: 2),
+        child: Text(
+          '${r.storeName}：${r.statusText}'
+              '${r.wallMs > 0 ? ' · 整店 ${_fmtDur(r.wallMs)}' : ''}'
+              '${r.error != null ? '（${r.error}）' : ''}',
+          style: TextStyle(
+              fontSize: 12,
+              color: r.status == 'success'
+                  ? AppConstants.successColor
+                  : (r.status == 'waitingLogin'
+                      ? const Color(0xFFFFB300)
+                      : AppConstants.errorColor)),
+        ),
+      ));
+      if (stepText.isNotEmpty) {
+        storeRows.add(Text(stepText,
+            style: const TextStyle(
+                fontSize: 11, color: AppConstants.textSecondary)));
+      }
+    }
+
+    return ExpansionTile(
+      tilePadding: EdgeInsets.zero,
+      childrenPadding: const EdgeInsets.only(bottom: 4),
+      dense: true,
+      title: Row(
+        children: [
+          Expanded(
+            child: Text(
+              '${job.type.label} ${job.barcode}'
+              '${job.productName.isNotEmpty ? ' · ${job.productName}' : ''}',
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: const TextStyle(
+                  fontSize: 13, fontWeight: FontWeight.w600),
+            ),
+          ),
+          Container(
+            padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 1),
+            decoration: BoxDecoration(
+              color: color,
+              borderRadius: BorderRadius.circular(8),
+            ),
+            child: Text(job.status.label,
+                style: const TextStyle(
+                    color: Colors.white,
+                    fontSize: 10,
+                    fontWeight: FontWeight.bold)),
+          ),
+        ],
+      ),
+      subtitle: Text(
+        '提交 ${_fmtTime(job.createdAt)} · 尝试 ${job.attempts}/${PhotoQueueService.maxAttempts} · 已耗时 ${job.elapsedText}',
+        style:
+            const TextStyle(fontSize: 11, color: AppConstants.textSecondary),
+      ),
+      children: [
+        ...storeRows,
+        if (job.status.canRetry)
+          Row(
+            mainAxisAlignment: MainAxisAlignment.end,
+            children: [
+              TextButton(
+                onPressed: () => _retryPhotoJob(job),
+                child: const Text('重新排队'),
+              ),
+              TextButton(
+                onPressed: () => _deletePhotoJob(job),
+                child: const Text('删除记录'),
+              ),
+            ],
+          )
+        else
+          Align(
+            alignment: Alignment.centerRight,
+            child: TextButton(
+              onPressed: () => _deletePhotoJob(job),
+              child: const Text('删除记录'),
+            ),
+          ),
+      ],
+    );
+  }
+
+  String _two(int v) => v.toString().padLeft(2, '0');
+
+  String _fmtTime(DateTime t) =>
+      '${t.year}-${_two(t.month)}-${_two(t.day)} ${_two(t.hour)}:${_two(t.minute)}:${_two(t.second)}';
+
+  Future<void> _retryPhotoJob(PhotoJob job) async {
+    final err = await PhotoQueueService.instance.retryJob(job.id);
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+      content: Text(err ?? '已重新加入队列'),
+      duration: const Duration(seconds: 2),
+    ));
+  }
+
+  Future<void> _deletePhotoJob(PhotoJob job) async {
+    await PhotoQueueService.instance.deleteJob(job.id);
+  }
+
+  Future<void> _confirmClearPhotoHistory() async {
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('清空照片队列历史'),
+        content: const Text('将删除全部历史记录及其保留的本地图片，失败任务将无法再自动重试。确定清空？'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text('取消'),
+          ),
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('清空'),
+          ),
+        ],
+      ),
+    );
+    if (ok == true) {
+      await PhotoQueueService.instance.clearHistory();
+    }
   }
 
   Widget _buildRestockConfigCard() {

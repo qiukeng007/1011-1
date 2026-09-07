@@ -13,6 +13,7 @@ import '../models/product_result.dart';
 import '../models/restock_prefill_data.dart';
 import '../services/login_service.dart';
 import '../services/product_image_cache.dart';
+import '../services/photo_queue_service.dart';
 import '../services/query_service.dart';
 import '../services/session_manager.dart';
 import '../services/query_logger.dart';
@@ -106,6 +107,9 @@ class _QueryPageState extends State<QueryPage> with AutomaticKeepAliveClientMixi
   // 用户上传的商品图片（条码 -> 图片URL）
   final Map<String, String> _productImageOverrides = {};
   bool _uploadingProductImage = false;
+  StreamSubscription<PhotoJobEvent>? _photoQueueSub;
+  String? _queueWatchBarcode;
+  String? _queueWatchUid;
 
   /// 供货商/商品名称等数据同步中：不遮全屏，仅禁用扫码/补货（打印不受影响）
   bool _syncingProductData = false;
@@ -141,11 +145,32 @@ class _QueryPageState extends State<QueryPage> with AutomaticKeepAliveClientMixi
   @override
   void initState() {
     super.initState();
+    _photoQueueSub = PhotoQueueService.instance.events.listen(_onPhotoQueueEvent);
     widget.imageUpdateNotifier?.addListener(_handleRestockImageUpdate);
     widget.supplierUpdateNotifier?.addListener(_handleRestockSupplierUpdate);
     _loadOperatorName();
     _checkLoginStatuses();
     _startKeepAlive();
+  }
+
+  /// 照片后台队列完成事件：回写图片URL；失败/部分成功给出提示
+  void _onPhotoQueueEvent(PhotoJobEvent e) {
+    if (!mounted) return;
+    final isWatch = e.barcode == _queueWatchBarcode &&
+        (_queueWatchUid == null ||
+            e.productUid == null ||
+            e.productUid == _queueWatchUid);
+    if (e.imageUrl != null && e.imageUrl!.isNotEmpty) {
+      setState(() {
+        _productImageOverrides[e.barcode] = e.imageUrl!;
+      });
+    }
+    if (isWatch &&
+        (e.status == PhotoJobStatus.partial ||
+            e.status == PhotoJobStatus.failed)) {
+      _showBanner('照片${e.status.label}：成功 ${e.successCount}/${e.totalStores} 家店，可到设置页查看并重试',
+          isError: true);
+    }
   }
 
   /// 补货提交新图片后由 HomePage 通知：更新本地覆盖并刷新显示
@@ -301,6 +326,7 @@ class _QueryPageState extends State<QueryPage> with AutomaticKeepAliveClientMixi
     _timerRunning = false;
     _keepAliveTimer?.cancel();
     _bannerTimer?.cancel();
+    _photoQueueSub?.cancel();
     widget.imageUpdateNotifier?.removeListener(_handleRestockImageUpdate);
     widget.supplierUpdateNotifier?.removeListener(_handleRestockSupplierUpdate);
     _barcodeController.dispose();
@@ -985,15 +1011,8 @@ class _QueryPageState extends State<QueryPage> with AutomaticKeepAliveClientMixi
     );
   }
 
-/// 无图时点击：拍照/导入图片 → CropPage 手动裁剪成正方形 → 逐个门店上传
+/// 无图时点击：拍照/导入图片 → CropPage 手动裁剪成正方形 → 后台队列提交
   Future<void> _addProductImage(ProductData data, String barcode) async {
-    // 只把新图片写入勾选（enabled）门店
-    final targetStores = widget.configs.where((c) => c.enabled).toList();
-    if (targetStores.isEmpty) {
-      _showBanner('未勾选任何门店，无法上传图片', isError: true);
-      return;
-    }
-
     // 选择图片来源
     final source = await showModalBottomSheet<ImageSource>(
       context: context,
@@ -1033,109 +1052,33 @@ class _QueryPageState extends State<QueryPage> with AutomaticKeepAliveClientMixi
 
     setState(() => _uploadingProductImage = true);
     try {
-      // 银豹限制单图不超过 3MB，上传前统一压缩到 500KB 以内，体积小更稳定
-      final bytes =
-          _compressImageForUpload(await File(croppedPath).readAsBytes());
-      // 所有门店并行上传（银豹图片按门店隔离，不会自动同步），失败自动重试 1 次
-      // 静默重试直到成功（最多 5 次，失败自动重试，不中断不打扰）
-      final results = await Future.wait(targetStores.map((store) async {
-        String? lastErr;
-        for (var attempt = 0; attempt < 5; attempt++) {
-          if (attempt > 0) {
-            await Future.delayed(const Duration(seconds: 2));
-          }
-          try {
-            final (err, url) = await widget.queryService.replaceProductImage(
-              store,
-              barcode,
-              bytes,
-              'IMG_${DateTime.now().millisecondsSinceEpoch}.jpg',
-              productUid: data.uid?.toString(),
-            );
-            if (err == null && url != null) {
-              return (name: store.name, ok: true, url: url, error: null as String?);
-            }
-            if (err == '未登录') {
-              return (name: store.name, ok: false, url: null as String?, error: null as String?);
-            }
-            lastErr = err;
-          } catch (e) {
-            lastErr = e.toString();
-          }
-        }
-        return (name: store.name, ok: false, url: null as String?, error: lastErr);
-      }));
-      var successCount = 0;
-      final failedStores = <String>[];
-      String? lastUrl;
-      for (final r in results) {
-        if (r.ok && r.url != null) {
-          successCount++;
-          lastUrl = r.url;
-        } else if (r.error != null) {
-          failedStores.add('${r.name}:${r.error}');
-        }
+      final stores = widget.configs
+          .where((c) => c.enabled && (c.storeId.isNotEmpty || c.isValid))
+          .toList();
+      if (stores.isEmpty) {
+        _showBanner('没有可同步的有效门店，请先完成门店登录', isError: true);
+        return;
       }
-      if (successCount > 0 && lastUrl != null) {
-        _productImageOverrides[barcode] = lastUrl;
-        ProductImageCache.cache(lastUrl, bytes);
-      }
+      final raw = await File(croppedPath).readAsBytes();
+      final job = await PhotoQueueService.instance.enqueue(
+        type: PhotoJobType.add,
+        barcode: barcode,
+        productName: data.name,
+        productUid: data.uid?.toString(),
+        imageBytes: raw,
+        opName: opName,
+        writeDesc: true,
+        stores: stores,
+      );
+      _queueWatchBarcode = barcode;
+      _queueWatchUid = data.uid?.toString();
       if (!mounted) return;
-      if (successCount > 0) {
-        // 同步写入操作记录描述（失败不阻断，只提示）
-        final descErrors = <String>[];
-        for (final store in targetStores) {
-          final err = await widget.queryService.updateProductOperationNote(
-            store,
-            barcode,
-            opName,
-            '更新照片',
-            productUid: data.uid?.toString(),
-          );
-          if (err != null && err != '未登录') {
-            descErrors.add('${store.name}：$err');
-          }
-        }
-        if (!mounted) return;
-        setState(() {});
-        final baseMsg = successCount == targetStores.length
-            ? '图片上传成功 ✓（$successCount 个勾选门店）'
-            : '部分勾选门店成功（$successCount/${targetStores.length}）：${failedStores.join('；')}';
-        _showBanner(descErrors.isEmpty
-            ? baseMsg
-            : '$baseMsg；描述未写入：${descErrors.join('；')}',
-            isError: descErrors.isNotEmpty);
-      } else {
-        _showBanner('图片上传失败：${failedStores.join('；')}', isError: true);
-      }
+      _showBanner(
+          '照片已加入后台队列，剩余 ${PhotoQueueService.instance.pendingCount} 条（自动同步 ${job.stores.length} 个门店）');
     } catch (e) {
-      if (mounted) _showBanner('上传出错：$e', isError: true);
+      if (mounted) _showBanner('照片入队失败：$e', isError: true);
     } finally {
       if (mounted) setState(() => _uploadingProductImage = false);
-    }
-  }
-
-  /// 上传图片统一压缩到 500KB 以内
-  List<int> _compressImageForUpload(Uint8List bytes) {
-    if (bytes.length < 512 * 1024) return bytes; // 已 ≤500KB
-    try {
-      final decoded = img.decodeImage(bytes);
-      if (decoded == null) return bytes;
-      final img2 = decoded.width >= decoded.height
-          ? img.copyResize(decoded, width: 1200)
-          : img.copyResize(decoded, height: 1200);
-      // 逐级降质量直到 ≤500KB
-      for (final q in [85, 70, 50, 35]) {
-        final encoded = img.encodeJpg(img2, quality: q);
-        if (encoded.length < 512 * 1024) return encoded;
-      }
-      // 仍超限：缩小到 800 再压
-      final img3 = img2.width >= img2.height
-          ? img.copyResize(img2, width: 800)
-          : img.copyResize(img2, height: 800);
-      return img.encodeJpg(img3, quality: 60);
-    } catch (_) {
-      return bytes;
     }
   }
 

@@ -1900,6 +1900,22 @@ class QueryService {
 
   // ==================== 供货商 UID 缓存（静默获取） ====================
 
+  /// 仅本地判断某门店当前是否有可用 Cookie（不发 HTTP 请求），
+  /// 供照片队列在“等待登录”状态下检测登录恢复。
+  Future<bool> hasSessionCookie(StoreConfig store) async {
+    try {
+      final cookie = await _sessionManager.getCookie(store.storeKey);
+      return cookie != null && cookie.isNotEmpty;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  /// 与主版本保持同名接口：本版本未做「门店→条码→商品ID」定位缓存，
+  /// 返回 null 时由 replaceProductImage 自行搜索定位商品。
+  String? getCachedProductId(StoreConfig store, String barcode, dynamic uid) =>
+      null;
+
   Future<Map<String, String>> _loadSupplierUidCache(String storeKey) async {
     try {
       final prefs = await SharedPreferences.getInstance();
@@ -2265,12 +2281,15 @@ class QueryService {
   /// 替换商品图片：先删除银豹商品全部旧图，再上传新图
   /// 银豹支持一商品多张图片，仅上传新图不会优先显示，需先删除旧图再上传替换
   /// 返回 (error, imageUrl)：error 为 null 表示成功，imageUrl 为完整可显示的图片地址
+  /// [onStep] 可选：上报各步骤耗时(name, 毫秒, detail)，供照片队列日志分析
   Future<(String?, String?)> replaceProductImage(
     StoreConfig store,
     String barcode,
     List<int> imageBytes,
     String imageName, {
     String? productUid,
+    String? productId,
+    void Function(String name, int ms, String? detail)? onStep,
   }) async {
     final baseUrl = store.baseUrl.replaceAll(RegExp(r'/$'), '');
     final code = barcode.trim();
@@ -2279,12 +2298,21 @@ class QueryService {
     final cookie = await _sessionManager.getCookie(store.storeKey);
     if (cookie == null || cookie.isEmpty) return ('未登录', null);
 
+    final sw = Stopwatch()..start();
+    void recordStep(String name, [String? detail]) {
+      onStep?.call(name, sw.elapsedMilliseconds, detail);
+      sw..reset()..start();
+    }
+
     try {
       // 1. 获取 userId
       final userId = await _resolveStoreUserId(store, cookie);
       if (userId == null) return ('无法获取门店信息', null);
+      recordStep('切店/获取userId');
 
-      // 2. 搜索条码获取 productId
+      // 2. 定位该门店的商品ID（照片队列已传 productId 时跳过重新搜索）
+      var pid = productId;
+      if (pid == null || pid.isEmpty) {
       final pageData = _encodeForm({
         'userId': userId,
         'enable': '1',
@@ -2328,20 +2356,25 @@ class QueryService {
 
       final contentView = searchData['contentView'] as String? ?? '';
       // 优先按商品 uid 精准定位（同一条码多个商品时更新用户选中的那一个）
-      String? productId;
+      String? foundPid;
       if (productUid != null && productUid.isNotEmpty) {
         final uidRowRegex = RegExp(
             r'<tr\s+data="(\d+)"\s+data-uid="(\d+)"[^>]*>');
         for (final m in uidRowRegex.allMatches(contentView)) {
           if (m.group(2) == productUid) {
-            productId = m.group(1);
+            foundPid = m.group(1);
             break;
           }
         }
       }
-      productId ??=
+      foundPid ??=
           RegExp(r'<tr\s+data="(\d+)"').firstMatch(contentView)?.group(1);
-      if (productId == null) return ('未找到该商品', null);
+      if (foundPid == null) return ('未找到该商品', null);
+      pid = foundPid;
+      recordStep('定位商品ID');
+      } else {
+      recordStep('定位商品ID', '使用缓存');
+      }
 
       // 3. FindProduct 获取商品旧图片列表（productimages[].id）
       final findUri = Uri.parse('$baseUrl/Product/FindProduct');
@@ -2355,7 +2388,7 @@ class QueryService {
           'application/x-www-form-urlencoded; charset=UTF-8');
       findReq.headers.set('Cookie', cookie);
       findReq.followRedirects = false;
-      findReq.write('productId=$productId');
+      findReq.write('productId=$pid');
       final findResp = await findReq.close().timeout(const Duration(seconds: 15));
       final findBody = await _readBody(findResp);
 
@@ -2371,6 +2404,7 @@ class QueryService {
       }
       final product = findData['product'] as Map<String, dynamic>?;
       final oldImages = (product?['productimages'] as List?) ?? const <dynamic>[];
+      recordStep('查询商品详情');
 
       // 4. 删除全部旧图（任一张删除失败则中止，保证替换一致性）
       for (final item in oldImages) {
@@ -2406,10 +2440,11 @@ class QueryService {
           // 响应非 JSON 时按成功处理
         }
       }
+      recordStep('删除旧图');
 
       // 5. 上传新图（独立上传接口，不需要 SaveProduct）
       final uploadUri = Uri.parse(
-          '$baseUrl/Product/UploadProductImage?userId=$userId&productId=$productId&forMulColorSize=false');
+          '$baseUrl/Product/UploadProductImage?userId=$userId&productId=$pid&forMulColorSize=false');
       final client = HttpClient();
       client.connectionTimeout = const Duration(seconds: 15);
       final request = await client.postUrl(uploadUri);
@@ -2435,11 +2470,34 @@ class QueryService {
       body.addAll(imageBytes);
       body.addAll(utf8.encode('\r\n--$boundary--\r\n'));
       request.add(body);
-      final resp = await request.close().timeout(const Duration(seconds: 60));
-      final respBody = await _readBody(resp);
+      final uploadKb = (imageBytes.length / 1024).ceil();
+      // 上传分两段计时：发送请求(含等响应头) 与 读取响应体，定位慢在网络还是服务器
+      final sendSw = Stopwatch()..start();
+      String? sendFail;
+      HttpClientResponse? resp;
+      try {
+        resp = await request.close().timeout(const Duration(seconds: 60));
+      } catch (e) {
+        sendFail = '${e.runtimeType}: $e';
+      }
+      onStep?.call('上传图片-发送请求', sendSw.elapsedMilliseconds,
+          sendFail != null ? '失败: $sendFail' : '约${uploadKb}KB');
+      if (sendFail != null) return ('上传失败: $sendFail', null);
+      final readSw = Stopwatch()..start();
+      String? readFail;
+      String respBody = '';
+      try {
+        respBody = await _readBody(resp!);
+      } catch (e) {
+        readFail = '${e.runtimeType}: $e';
+      }
+      onStep?.call('上传图片-读取响应', readSw.elapsedMilliseconds,
+          readFail != null ? '失败: $readFail' : null);
+      if (readFail != null) return ('读取响应失败: $readFail', null);
 
-      if (resp.statusCode != 200) {
-        return ('上传失败 (HTTP ${resp.statusCode})', null);
+      final uploadResp = resp!;
+      if (uploadResp.statusCode != 200) {
+        return ('上传失败 (HTTP ${uploadResp.statusCode})', null);
       }
 
       Map<String, dynamic> result;

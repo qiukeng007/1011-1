@@ -17,6 +17,7 @@ import '../services/auth_service.dart';
 import '../services/update_service.dart';
 import '../services/foreground_service.dart';
 import '../services/keepalive_logger.dart';
+import '../services/photo_queue_service.dart';
 import '../models/keepalive_log.dart';
 import '../utils/constants.dart';
 import 'settings_page.dart';
@@ -41,7 +42,8 @@ class _StoreVerifyStatus {
   _StoreVerifyStatus({required this.name, this.state = _VerifyState.pending, this.message = ''});
 }
 
-class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
+class _HomePageState extends State<HomePage>
+    with WidgetsBindingObserver, SingleTickerProviderStateMixin {
   int _currentTab = 0;
   final PageController _pageController = PageController();
 
@@ -81,17 +83,29 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
       ValueNotifier(null);
   DateTime? _lastResumeRefreshTime;
   static const _resumeRefreshDebounce = Duration(seconds: 60);
+  int _photoQueueCount = 0;
+  bool _queueProcessing = false;
+  late final AnimationController _queueRing;
+  StreamSubscription<PhotoJobEvent>? _photoQueueSub;
 
   @override
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
+    PhotoQueueService.instance.addListener(_onPhotoQueueChanged);
+    _photoQueueSub = PhotoQueueService.instance.events.listen(_onPhotoJobEvent);
+    _queueRing = AnimationController(
+        vsync: this, duration: const Duration(milliseconds: 750));
+    _onPhotoQueueChanged();
     _initAuth();
   }
 
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
+    PhotoQueueService.instance.removeListener(_onPhotoQueueChanged);
+    _photoQueueSub?.cancel();
+    _queueRing.dispose();
     _serverCheckTimer?.cancel();
     _keepAliveTimer?.cancel();
     _restockImageNotifier.dispose();
@@ -150,6 +164,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     _sessionManager = SessionManager();
     _loginService = LoginService(_sessionManager);
     _queryService = QueryService(_sessionManager);
+    await PhotoQueueService.instance.attach(_queryService);
     _loadConfigs();
   }
 
@@ -760,6 +775,91 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     _loadConfigs(skipVerify: true);
   }
 
+  void _onPhotoQueueChanged() {
+    if (!mounted) return;
+    final n = PhotoQueueService.instance.pendingCount;
+    final running = PhotoQueueService.instance.isProcessingActive;
+    if (running != _queueProcessing || n != _photoQueueCount) {
+      setState(() {
+        _queueProcessing = running;
+        _photoQueueCount = n;
+      });
+    }
+    if (n > 0) {
+      if (!_queueRing.isAnimating) _queueRing.repeat();
+    } else {
+      if (_queueRing.isAnimating) {
+        _queueRing
+          ..stop()
+          ..reset();
+      }
+    }
+  }
+
+  /// 队列任务完成后：全成功时通知搜索页更新该条码的商品图片
+  void _onPhotoJobEvent(PhotoJobEvent e) {
+    if (!mounted) return;
+    if (e.fullSuccess && e.imageUrl != null && e.imageUrl!.isNotEmpty) {
+      _restockImageNotifier.value =
+          (barcode: e.barcode, imageUrl: e.imageUrl!);
+    }
+  }
+
+  /// 首页顶部左侧“队列 N”徽标：彩色三色圈 + 数字；
+  /// 有任务正在上传时三色圈旋转，空闲时静止显示。
+  Widget _buildPhotoQueuePill() {
+    final n = _photoQueueCount;
+    final text = n > 99 ? '99+' : '$n';
+    return Center(
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          const Text('队列',
+              style: TextStyle(
+                  color: Colors.white,
+                  fontSize: 14,
+                  fontWeight: FontWeight.w600)),
+          const SizedBox(width: 5),
+          SizedBox(
+            width: 24,
+            height: 24,
+            child: Stack(
+              alignment: Alignment.center,
+              children: [
+                // 红/黄/绿三色圈：运行中整体旋转
+                RotationTransition(
+                  turns: _queueRing,
+                  child: const CustomPaint(
+                    size: Size.square(24),
+                    painter: _PhotoQueueTriColorRingPainter(),
+                  ),
+                ),
+                SizedBox(
+                  width: 16,
+                  height: 16,
+                  child: FittedBox(
+                    fit: BoxFit.scaleDown,
+                    child: Text(text,
+                        maxLines: 1,
+                        style: const TextStyle(
+                            color: Colors.white,
+                            fontSize: 13,
+                            fontWeight: FontWeight.bold,
+                            shadows: [
+                              Shadow(
+                                  color: Colors.black54,
+                                  blurRadius: 2.0)
+                            ])),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     if (_loading) {
@@ -796,6 +896,9 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
 
     return Scaffold(
       appBar: AppBar(
+        automaticallyImplyLeading: false,
+        leadingWidth: _photoQueueCount > 0 ? 80 : null,
+        leading: _photoQueueCount > 0 ? _buildPhotoQueuePill() : null,
         title: Row(
           mainAxisSize: MainAxisSize.min,
           children: [
@@ -981,4 +1084,37 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
       ),
     );
   }
+}
+
+
+/// 队列角标的三色圈画笔（红/黄/绿三段圆弧）
+class _PhotoQueueTriColorRingPainter extends CustomPainter {
+  const _PhotoQueueTriColorRingPainter();
+
+  static const double _rad120 = 2.0943951023931953; // 120° 弧度
+  static const double _rad90 = 1.5707963267948966; // 90° 弧度
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    const stroke = 4.0;
+    final center = size.center(Offset.zero);
+    final rect = Rect.fromCircle(
+        center: center, radius: (size.shortestSide - stroke) / 2 - 0.5);
+    const colors = [
+      Color(0xFFE53935), // 红
+      Color(0xFFFFC107), // 黄
+      Color(0xFF00E676), // 绿
+    ];
+    final paint = Paint()
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = stroke
+      ..strokeCap = StrokeCap.butt;
+    for (var i = 0; i < colors.length; i++) {
+      paint.color = colors[i];
+      canvas.drawArc(rect, -_rad90 + _rad120 * i, _rad120, false, paint);
+    }
+  }
+
+  @override
+  bool shouldRepaint(covariant CustomPainter oldDelegate) => false;
 }
