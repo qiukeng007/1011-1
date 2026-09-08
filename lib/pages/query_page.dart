@@ -111,6 +111,9 @@ class _QueryPageState extends State<QueryPage> with AutomaticKeepAliveClientMixi
   String? _queueWatchBarcode;
   String? _queueWatchUid;
 
+  /// 当前展示商品的照片是否已提交后台队列（处理完前显示“上传中/队列中”提示）
+  bool _photoQueuedMark = false;
+
   /// 供货商/商品名称等数据同步中：不遮全屏，仅禁用扫码/补货（打印不受影响）
   bool _syncingProductData = false;
 
@@ -156,6 +159,10 @@ class _QueryPageState extends State<QueryPage> with AutomaticKeepAliveClientMixi
   /// 照片后台队列完成事件：回写图片URL；失败/部分成功给出提示
   void _onPhotoQueueEvent(PhotoJobEvent e) {
     if (!mounted) return;
+    final curBarcode = _lastResult?.barcode;
+    if (curBarcode != null && e.barcode == curBarcode) {
+      unawaited(_refreshPhotoQueuedMark());
+    }
     final isWatch = e.barcode == _queueWatchBarcode &&
         (_queueWatchUid == null ||
             e.productUid == null ||
@@ -180,6 +187,7 @@ class _QueryPageState extends State<QueryPage> with AutomaticKeepAliveClientMixi
     setState(() {
       _productImageOverrides[v.barcode] = v.imageUrl;
     });
+    unawaited(_refreshPhotoQueuedMark());
   }
 
   /// 补货提交更换供货商后由 HomePage 通知：更新本地覆盖并刷新显示
@@ -365,6 +373,7 @@ class _QueryPageState extends State<QueryPage> with AutomaticKeepAliveClientMixi
       _chosenProduct = null;
       _queryStartTime = DateTime.now();
       _elapsedText = '';
+      _photoQueuedMark = false;
     });
 
     _timerRunning = true;
@@ -469,14 +478,43 @@ class _QueryPageState extends State<QueryPage> with AutomaticKeepAliveClientMixi
         );
         QueryLogger().add(logEntry);
 
-        // 记录操作日志
-        final storeNames = _lastResult!.stores.values.map((s) => s.storeName).join('、');
-        OperationLogService.add(
-          store: storeNames,
-          action: '多店查询',
-          barcode: barcode.trim(),
-          detail: _elapsedText,
-        );
+        // 记录操作日志：仅记录有结果的搜索，附带当时库存/商品名称/中文翻译
+        final resultStores = _lastResult!.stores;
+        final anyFound =
+            resultStores.values.any((s) => s.ok && s.data != null);
+        if (anyFound) {
+          final prod = _currentProductData(_lastResult!);
+          final prodName = prod?.name.trim() ?? '';
+          final stockParts = <String>[];
+          for (final s in resultStores.values) {
+            final d = s.data;
+            final qty = d?.stock;
+            final unit = (d == null || d.unit.isEmpty || d.unit == '—')
+                ? ''
+                : d.unit;
+            final qtyText = qty == null
+                ? '—'
+                : (qty == qty.roundToDouble()
+                    ? qty.toInt().toString()
+                    : qty.toStringAsFixed(2));
+            stockParts.add('${s.storeName}:$qtyText$unit');
+          }
+          final storeNames =
+              resultStores.values.map((s) => s.storeName).join('、');
+          final entryId = await OperationLogService.add(
+            store: storeNames,
+            action: '多店查询',
+            barcode: barcode.trim(),
+            detail: _elapsedText,
+            name: prodName.isEmpty ? null : prodName,
+            stocks: stockParts.isEmpty ? null : stockParts.join('  '),
+          );
+          // 中文翻译名称异步补全到该条记录
+          if (prodName.isNotEmpty && _needsTranslation(prodName)) {
+            unawaited(_fillLogTranslation(entryId, prodName));
+          }
+        }
+        unawaited(_refreshPhotoQueuedMark());
 
         // 后台预下载商品图片：只预下载显示用图（小体积，保证卡片秒开）；
         // 大原图不主动批量下载，点击放大预览或发起补货时按需下载
@@ -514,6 +552,30 @@ class _QueryPageState extends State<QueryPage> with AutomaticKeepAliveClientMixi
           _querying = false;
         });
       }
+    }
+  }
+
+  /// 刷新“照片已提交队列”标记：当前商品在后台队列中还有未完成的任务即显示
+  Future<void> _refreshPhotoQueuedMark() async {
+    final r = _lastResult;
+    if (r == null) return;
+    final prod = _currentProductData(r);
+    if (prod == null) return;
+    final uid = prod.uid?.toString();
+    final code = prod.barcode.isNotEmpty ? prod.barcode : r.barcode;
+    var queued = false;
+    try {
+      final jobs = await PhotoQueueService.instance.pendingJobs();
+      for (final j in jobs) {
+        if (j.status.isFinished) continue;
+        if (j.barcode == code && (j.productUid ?? '') == (uid ?? '')) {
+          queued = true;
+          break;
+        }
+      }
+    } catch (_) {}
+    if (mounted && queued != _photoQueuedMark) {
+      setState(() => _photoQueuedMark = queued);
     }
   }
 
@@ -972,41 +1034,90 @@ class _QueryPageState extends State<QueryPage> with AutomaticKeepAliveClientMixi
       onTap: hasImage
           ? () => _showProductImagePreview(data, barcode)
           : () => _addProductImage(data, barcode),
-      child: Container(
-        width: 70,
-        height: 70,
-        decoration: BoxDecoration(
-          color: AppConstants.bgColor,
-          borderRadius: BorderRadius.circular(9),
-          border: Border.all(color: AppConstants.dividerColor),
-        ),
-        child: _uploadingProductImage
-            ? const Center(
-                child: SizedBox(
-                  width: 20,
-                  height: 20,
-                  child: CircularProgressIndicator(strokeWidth: 2),
-                ),
-              )
-            : hasImage
-                ? _CachedImage(
-                    url: imageUrl!,
-                    width: 70,
-                    height: 70,
-                    decodeWidth: 140,
-                    decodeHeight: 140,
+      child: Stack(
+        clipBehavior: Clip.none,
+        children: [
+          Container(
+            width: 70,
+            height: 70,
+            decoration: BoxDecoration(
+              color: AppConstants.bgColor,
+              borderRadius: BorderRadius.circular(9),
+              border: Border.all(color: AppConstants.dividerColor),
+            ),
+            child: _uploadingProductImage
+                ? const Center(
+                    child: SizedBox(
+                      width: 20,
+                      height: 20,
+                      child: CircularProgressIndicator(strokeWidth: 2),
+                    ),
                   )
-                : Column(
-                    mainAxisAlignment: MainAxisAlignment.center,
-                    children: [
-                      const Icon(Icons.camera_alt, size: 24, color: AppConstants.textSecondary),
-                      const SizedBox(height: 2),
-                      const Text(
-                        '添加图片',
-                        style: TextStyle(fontSize: 9, color: AppConstants.textSecondary),
-                      ),
-                    ],
-                  ),
+                : _photoQueuedMark && !hasImage
+                    // 照片已提交后台队列但还没传完：框内转圈提示，直观知道在排队上传
+                    ? const Center(
+                        child: Column(
+                          mainAxisAlignment: MainAxisAlignment.center,
+                          children: [
+                            SizedBox(
+                              width: 18,
+                              height: 18,
+                              child: CircularProgressIndicator(strokeWidth: 2),
+                            ),
+                            SizedBox(height: 3),
+                            Text(
+                              '上传中',
+                              style: TextStyle(
+                                  fontSize: 9,
+                                  color: AppConstants.textSecondary),
+                            ),
+                          ],
+                        ),
+                      )
+                    : hasImage
+                        ? _CachedImage(
+                            url: imageUrl!,
+                            width: 70,
+                            height: 70,
+                            decodeWidth: 140,
+                            decodeHeight: 140,
+                          )
+                        : Column(
+                            mainAxisAlignment: MainAxisAlignment.center,
+                            children: [
+                              const Icon(Icons.camera_alt, size: 24, color: AppConstants.textSecondary),
+                              const SizedBox(height: 2),
+                              const Text(
+                                '添加图片',
+                                style: TextStyle(fontSize: 9, color: AppConstants.textSecondary),
+                              ),
+                            ],
+                          ),
+          ),
+          // 有图但还有队列任务在跑（换图等）时，角标提示仍在处理
+          if (_photoQueuedMark && hasImage)
+            Positioned(
+              top: -3,
+              right: -3,
+              child: Container(
+                padding:
+                    const EdgeInsets.symmetric(horizontal: 4, vertical: 1),
+                decoration: BoxDecoration(
+                  color: const Color(0xFF1E88E5),
+                  borderRadius: BorderRadius.circular(8),
+                  border: Border.all(color: Colors.white, width: 1),
+                ),
+                child: const Text(
+                  '队列中',
+                  style: TextStyle(
+                      fontSize: 8,
+                      color: Colors.white,
+                      height: 1.2,
+                      fontWeight: FontWeight.w600),
+                ),
+              ),
+            ),
+        ],
       ),
     );
   }
@@ -1072,6 +1183,7 @@ class _QueryPageState extends State<QueryPage> with AutomaticKeepAliveClientMixi
       );
       _queueWatchBarcode = barcode;
       _queueWatchUid = data.uid?.toString();
+      if (mounted) setState(() => _photoQueuedMark = true);
       if (!mounted) return;
       _showBanner(
           '照片已加入后台队列，剩余 ${PhotoQueueService.instance.pendingCount} 条（自动同步 ${job.stores.length} 个门店）');
@@ -1226,7 +1338,20 @@ class _QueryPageState extends State<QueryPage> with AutomaticKeepAliveClientMixi
     return true;
   }
 
-  Future<void> _translate(String text) async {
+  /// 为操作记录异步补全商品中文翻译名称（失败不阻断记录展示）
+  Future<void> _fillLogTranslation(String entryId, String productName) async {
+    var t = _transCache[productName];
+    if ((t == null || t.isEmpty) && _needsTranslation(productName)) {
+      t = await _translate(productName);
+    }
+    if (t != null &&
+        t.isNotEmpty &&
+        t.toLowerCase() != productName.toLowerCase()) {
+      await OperationLogService.update(entryId, transName: t);
+    }
+  }
+
+  Future<String?> _translate(String text) async {
     try {
       final httpClient = HttpClient();
       httpClient.connectionTimeout = const Duration(seconds: 5);
@@ -1249,8 +1374,10 @@ class _QueryPageState extends State<QueryPage> with AutomaticKeepAliveClientMixi
       if (result != null && result.isNotEmpty && result.toLowerCase() != text.toLowerCase()) {
         _transCache[text] = result;
         if (mounted) setState(() {});
+        return result;
       }
     } catch (_) {}
+    return null;
   }
 
   Future<String?> _tryGoogleTranslate(HttpClient httpClient, String text) async {

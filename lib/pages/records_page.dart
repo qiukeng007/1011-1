@@ -158,6 +158,19 @@ class _RecordsPageState extends State<RecordsPage> {
                                 Expanded(child: Text('${log.barcode}  📋点击复制',
                                   style: const TextStyle(fontSize: 12, color: AppConstants.textSecondary))),
                               ]),
+                              // 商品名称/中文翻译/库存快照（搜索结果记录附带信息）
+                              if (log.name != null && log.name!.isNotEmpty) ...[
+                                const SizedBox(height: 4),
+                                _kvRow('名称', log.name!),
+                              ],
+                              if (log.transName != null && log.transName!.isNotEmpty) ...[
+                                const SizedBox(height: 2),
+                                _kvRow('翻译', log.transName!),
+                              ],
+                              if (log.stocks != null && log.stocks!.isNotEmpty) ...[
+                                const SizedBox(height: 2),
+                                _kvRow('库存', log.stocks!),
+                              ],
                               // Row 3: detail (if present)
                               if (log.detail != null && log.detail!.isNotEmpty) ...[
                                 const SizedBox(height: 4),
@@ -191,5 +204,23 @@ class _RecordsPageState extends State<RecordsPage> {
     else if (action.contains('打印')) { icon = Icons.print; color = AppConstants.primaryColor; }
     else { icon = Icons.circle; color = AppConstants.textSecondary; }
     return Icon(icon, size: 20, color: color);
+  }
+
+  Widget _kvRow(String label, String value) {
+    return Row(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Text('$label：',
+            style: const TextStyle(
+                fontSize: 11, color: AppConstants.textSecondary)),
+        Expanded(
+          child: Text(value,
+              style: const TextStyle(
+                  fontSize: 11,
+                  color: Color(0xFF333333),
+                  fontWeight: FontWeight.w600)),
+        ),
+      ],
+    );
   }
 }
